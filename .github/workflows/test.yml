@@ -1,0 +1,162 @@
+name: Test (TDD)
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.8', '3.9', '3.10', '3.11']
+    
+    name: Test - ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Cache pip packages
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install system dependencies (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libportaudio2 portaudio19-dev
+    
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements-test.txt
+        pip install -r requirements-server.txt
+        pip install -r requirements-client.txt
+    
+    - name: Run unit tests
+      run: |
+        pytest tests/ -v -m "not integration and not performance" \
+          --cov=server --cov=client \
+          --cov-report=xml --cov-report=term
+    
+    - name: Run integration tests
+      if: matrix.python-version == '3.10'  # 統合テストは1つのバージョンでのみ
+      run: |
+        pytest tests/ -v -m integration
+    
+    - name: Upload coverage to Codecov
+      if: matrix.python-version == '3.10' && matrix.os == 'ubuntu-latest'
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false
+
+  lint:
+    runs-on: ubuntu-latest
+    name: Lint Code
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install linting tools
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8 black isort mypy
+    
+    - name: Run flake8
+      run: |
+        flake8 server/ client/ tests/ --max-line-length=100 --ignore=E203,W503
+      continue-on-error: true
+    
+    - name: Check black formatting
+      run: |
+        black --check server/ client/ tests/
+      continue-on-error: true
+    
+    - name: Check import sorting
+      run: |
+        isort --check-only server/ client/ tests/
+      continue-on-error: true
+    
+    - name: Run mypy
+      run: |
+        mypy server/ client/ --ignore-missing-imports
+      continue-on-error: true
+
+  performance:
+    runs-on: ubuntu-latest
+    name: Performance Tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libportaudio2 portaudio19-dev
+        python -m pip install --upgrade pip
+        pip install -r requirements-test.txt
+        pip install -r requirements-server.txt
+        pip install -r requirements-client.txt
+    
+    - name: Run performance tests
+      run: |
+        pytest tests/ -v -m performance
+    
+    - name: Store performance results
+      uses: actions/upload-artifact@v3
+      with:
+        name: performance-results
+        path: |
+          *.log
+          htmlcov/
+
+  security:
+    runs-on: ubuntu-latest
+    name: Security Check
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install safety
+      run: |
+        python -m pip install --upgrade pip
+        pip install safety
+    
+    - name: Check for security vulnerabilities
+      run: |
+        pip install -r requirements-server.txt
+        pip install -r requirements-client.txt
+        safety check --json
+      continue-on-error: true

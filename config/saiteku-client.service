@@ -1,0 +1,33 @@
+[Unit]
+Description=Wake Saiteku Voice Assistant Client
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/wake-saiteku
+Environment="PATH=/home/pi/wake-saiteku/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+
+# 設定ファイルから環境変数を読み込み
+EnvironmentFile=/home/pi/wake-saiteku/config/client.env
+
+# Python仮想環境を使用して実行
+ExecStart=/home/pi/wake-saiteku/venv/bin/python /home/pi/wake-saiteku/client/client.py
+
+# 再起動設定
+Restart=always
+RestartSec=10
+
+# ログ設定
+StandardOutput=journal
+StandardError=journal
+
+# リソース制限（必要に応じて調整）
+MemoryLimit=1G
+CPUQuota=80%
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,33 @@
+[Unit]
+Description=Wake Saiteku Voice Assistant Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=saiteku
+Group=saiteku
+WorkingDirectory=/opt/wake-saiteku
+Environment="PATH=/opt/wake-saiteku/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+
+# 設定ファイルから環境変数を読み込み
+EnvironmentFile=/opt/wake-saiteku/config/server.env
+
+# Python仮想環境を使用して実行
+ExecStart=/opt/wake-saiteku/venv/bin/python /opt/wake-saiteku/server/server.py
+
+# 再起動設定
+Restart=always
+RestartSec=10
+
+# ログ設定
+StandardOutput=journal
+StandardError=journal
+
+# リソース制限（Whisperモデルに応じて調整）
+MemoryLimit=4G
+CPUQuota=200%
+
+[Install]
+WantedBy=multi-user.target

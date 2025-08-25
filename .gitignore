@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# Models
+models/
+*.onnx
+*.zip
+*.tar.gz
+*.gguf
+
+# Audio files
+*.wav
+*.mp3
+*.pcm
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# System
+.DS_Store
+Thumbs.db
+
+# Temp files
+tmp/
+temp/
+*.tmp
+
+# Config with secrets
+.env
+config/*.local.json

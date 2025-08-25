@@ -1,0 +1,150 @@
+version: 1
+disable_existing_loggers: false
+
+formatters:
+  default:
+    format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    datefmt: '%Y-%m-%d %H:%M:%S'
+  
+  detailed:
+    format: '%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(funcName)s() - %(message)s'
+    datefmt: '%Y-%m-%d %H:%M:%S'
+  
+  json:
+    class: 'pythonjsonlogger.jsonlogger.JsonFormatter'
+    format: '%(asctime)s %(name)s %(levelname)s %(filename)s %(lineno)d %(funcName)s %(message)s'
+  
+  colored:
+    class: 'colorlog.ColoredFormatter'
+    format: '%(log_color)s%(asctime)s - %(name)s - %(levelname)s - %(message)s%(reset)s'
+    datefmt: '%Y-%m-%d %H:%M:%S'
+    log_colors:
+      DEBUG: cyan
+      INFO: green
+      WARNING: yellow
+      ERROR: red
+      CRITICAL: red,bg_white
+
+handlers:
+  console:
+    class: logging.StreamHandler
+    level: INFO
+    formatter: colored
+    stream: ext://sys.stdout
+  
+  console_debug:
+    class: logging.StreamHandler
+    level: DEBUG
+    formatter: detailed
+    stream: ext://sys.stdout
+  
+  file_server:
+    class: logging.handlers.RotatingFileHandler
+    level: INFO
+    formatter: detailed
+    filename: logs/server.log
+    maxBytes: 10485760  # 10MB
+    backupCount: 5
+    encoding: utf8
+  
+  file_client:
+    class: logging.handlers.RotatingFileHandler
+    level: INFO
+    formatter: detailed
+    filename: logs/client.log
+    maxBytes: 10485760  # 10MB
+    backupCount: 5
+    encoding: utf8
+  
+  file_error:
+    class: logging.handlers.RotatingFileHandler
+    level: ERROR
+    formatter: detailed
+    filename: logs/error.log
+    maxBytes: 10485760  # 10MB
+    backupCount: 3
+    encoding: utf8
+  
+  file_json:
+    class: logging.handlers.RotatingFileHandler
+    level: INFO
+    formatter: json
+    filename: logs/app.json
+    maxBytes: 10485760  # 10MB
+    backupCount: 5
+    encoding: utf8
+  
+  file_performance:
+    class: logging.handlers.TimedRotatingFileHandler
+    level: INFO
+    formatter: json
+    filename: logs/performance.log
+    when: midnight
+    interval: 1
+    backupCount: 7
+    encoding: utf8
+  
+  file_audio:
+    class: logging.handlers.TimedRotatingFileHandler
+    level: DEBUG
+    formatter: detailed
+    filename: logs/audio.log
+    when: midnight
+    interval: 1
+    backupCount: 7
+    encoding: utf8
+
+loggers:
+  server:
+    level: INFO
+    handlers: [console, file_server, file_json, file_error]
+    propagate: false
+  
+  client:
+    level: INFO
+    handlers: [console, file_client, file_json, file_error]
+    propagate: false
+  
+  audio:
+    level: INFO
+    handlers: [console, file_audio]
+    propagate: false
+  
+  performance:
+    level: INFO
+    handlers: [file_performance]
+    propagate: false
+  
+  whisper:
+    level: INFO
+    handlers: [console, file_server]
+    propagate: false
+  
+  wake_word:
+    level: INFO
+    handlers: [console, file_client]
+    propagate: false
+  
+  api:
+    level: INFO
+    handlers: [console, file_server, file_json]
+    propagate: false
+  
+  uvicorn:
+    level: INFO
+    handlers: [console, file_server]
+    propagate: false
+  
+  uvicorn.access:
+    level: INFO
+    handlers: [file_server]
+    propagate: false
+  
+  uvicorn.error:
+    level: INFO
+    handlers: [console, file_error]
+    propagate: false
+
+root:
+  level: INFO
+  handlers: [console, file_error]
