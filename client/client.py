@@ -25,7 +25,24 @@ from datetime import datetime
 import numpy as np
 import sounddevice as sd
 import webrtcvad
-import vosk
+
+# --- プロジェクトルートを import path に追加（python client/client.py 実行対応）
+_PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from utils.wake_utils import recent_text_from_history, is_wake_in_text, squash_repeated_tokens, find_wake_match
+from utils.text_utils import dedupe_transcript
+from utils.stt_backends import create_local_stt_engine
+
+# .env の自動読み込み（任意）
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv(dotenv_path=Path(_PROJECT_ROOT) / ".env", override=False)
+    logger = logging.getLogger(__name__)
+    logger.debug(".env を読み込みました")
+except Exception:
+    pass
 
 # ========== ロギング設定 ==========
 logging.basicConfig(
@@ -61,6 +78,7 @@ class AudioConfig:
     CHANNELS: int = 1
     DTYPE: str = 'int16'
     INPUT_DEVICE: Optional[str] = os.getenv("AUDIO_INPUT_DEVICE")  # device index or name
+    OUTPUT_DEVICE: Optional[str] = os.getenv("AUDIO_OUTPUT_DEVICE")  # device index or name
     
     @property
     def frame_length(self) -> int:
@@ -81,10 +99,10 @@ class WakeConfig:
 
 @dataclass
 class VADConfig:
-    VAD_MODE: int = 2  # 0-3, 3が最も厳しい
-    MIN_UTTERANCE_MS: int = 400
-    END_SILENCE_MS: int = 800
-    MAX_RECORDING_MS: int = 10000
+    VAD_MODE: int = int(os.getenv("VAD_MODE", "2"))  # 0-3, 3が最も厳しい
+    MIN_UTTERANCE_MS: int = int(os.getenv("MIN_UTTERANCE_MS", "300"))
+    END_SILENCE_MS: int = int(os.getenv("END_SILENCE_MS", "800"))
+    MAX_RECORDING_MS: int = int(os.getenv("MAX_RECORDING_MS", "10000"))
 
 @dataclass
 class ServerConfig:
@@ -93,6 +111,15 @@ class ServerConfig:
     LOCAL_LLM_URL: str = os.getenv("LLM_LOCAL_URL", "http://127.0.0.1:8081/v1/chat/completions")
     LOCAL_LLM_MODEL: str = os.getenv("LLM_LOCAL_MODEL", "local-model")
     REQUEST_TIMEOUT: int = int(os.getenv("REQUEST_TIMEOUT", "30"))
+    # LLM速度/品質調整
+    LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.3"))
+    LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "200"))
+    LLM_TOP_P: float = float(os.getenv("LLM_TOP_P", "0.9"))
+    # 外部Chat API（OpenAI互換）設定（ストリーミング対応）
+    PREFER_CHAT_API: bool = os.getenv("PREFER_CHAT_API", "true").lower() == "true"
+    CHAT_API_BASE_URL: str = os.getenv("CHAT_API_BASE_URL", "")  # 例: http://localhost:8000/v1
+    CHAT_API_KEY: str = os.getenv("CHAT_API_KEY", "")
+    CHAT_API_MODEL: str = os.getenv("CHAT_API_MODEL", os.getenv("LLM_LOCAL_MODEL", "local-model"))
 
 # 設定インスタンス
 audio_config = AudioConfig()
@@ -100,27 +127,7 @@ wake_config = WakeConfig()
 vad_config = VADConfig()
 server_config = ServerConfig()
 
-# ========== Vosk初期化 ==========
-def initialize_vosk(model_path: str = "wake-saiteku/models/ja") -> vosk.Model:
-    """Voskモデルを初期化"""
-    vosk.SetLogLevel(-1)  # ログレベルを抑制
-    
-    if not os.path.isdir(model_path):
-        logger.error(f"Vosk日本語モデルが見つかりません: {model_path}")
-        logger.info("セットアップスクリプトを実行してモデルをダウンロードしてください")
-        sys.exit(1)
-    
-    logger.info(f"Voskモデルを読み込み中: {model_path}")
-    try:
-        model = vosk.Model(model_path)
-        logger.info("Voskモデルの読み込み完了")
-        return model
-    except Exception as e:
-        logger.error(f"Voskモデルの読み込みに失敗: {e}")
-        sys.exit(1)
-
-# モデル初期化
-vosk_model = initialize_vosk()
+# ========== Voskモデルは使用しません（sherpa-ONNX専用） ==========
 
 # ========== オーディオ処理 ==========
 class AudioProcessor:
@@ -130,13 +137,24 @@ class AudioProcessor:
         self.stream = None
         self._last_level_log = 0.0
         self.last_frame_time = time.time()
+        self._squelch_until = 0.0  # 再生音の取り込み抑制用
         
     def audio_callback(self, indata, frames, time_info, status):
         """オーディオコールバック"""
         if status:
             logger.warning(f"オーディオステータス: {status}")
+        now = time.time()
+        # 再生音がマイクに回り込むのを抑制（半二重的に無視）
+        if now < self._squelch_until:
+            # 取り込まないが、最後のフレーム時刻は更新
+            self.last_frame_time = now
+            return
         self.q.put(indata.copy())
         self.last_frame_time = time.time()
+
+    def squelch(self, duration_sec: float):
+        """指定時間、入力フレームを無視（再生音の回り込み対策）"""
+        self._squelch_until = max(self._squelch_until, time.time() + max(0.0, duration_sec))
         
     def start_stream(self):
         """オーディオストリーム開始"""
@@ -185,85 +203,201 @@ class AudioProcessor:
             except queue.Empty:
                 break
 
-# ========== Wake Word検知 ==========
-class WakeWordDetector:
-    def __init__(self, model: vosk.Model):
-        self.model = model
-        self.recognizer = vosk.KaldiRecognizer(model, audio_config.SAMPLE_RATE)
-        self._configure_grammar()
-        self.text_history: List[Tuple[str, float]] = []
-        
-    def reset(self):
-        """認識器をリセット"""
-        self.recognizer = vosk.KaldiRecognizer(self.model, audio_config.SAMPLE_RATE)
-        self._configure_grammar()
-        self.text_history.clear()
+# ========== Wake Word検知（sherpa-ONNX） ==========
 
-    def _configure_grammar(self):
-        """Wake Word専用の簡易文法を設定（誤検知抑制）"""
-        use_grammar = os.getenv("WAKE_USE_GRAMMAR", "true").lower() == "true"
-        if not use_grammar:
-            return
-        phrases = [
-            "もしもし",
-            "もしもし サイテク",
-            "もしもし サイテック",
-            "もしもし サイトク",
-            "サイテク",
-            "サイテック",
-            "サイトク",
-            "さいてく",
-            "さいてっく",
-            "さいとく",
-        ]
+
+class SherpaWakeWordDetector:
+    def __init__(self):
         try:
-            self.recognizer.SetGrammar(json.dumps(phrases, ensure_ascii=False))
-            logger.info("Wake用簡易文法を適用しました")
+            import sherpa_onnx as so
         except Exception as e:
-            logger.warning(f"Wake文法設定に失敗: {e}")
-    
+            raise RuntimeError(f"sherpa-onnx が見つかりません: {e}")
+        self.so = so
+        self.text_history: List[Tuple[str, float]] = []
+        self.last_text = ""
+        self._last_decode_t = 0.0
+        self._init_offline_recognizer()
+        self._pcm_buffer = np.zeros(0, dtype=np.int16)
+
+    def _env(self, name: str, default: Optional[str] = None) -> Optional[str]:
+        # WAKE_SHERPA_* を優先、なければ SHERPA_* を参照
+        return os.getenv(name) or os.getenv(name.replace("WAKE_", ""), default)
+
+    def _init_offline_recognizer(self):
+        so = self.so
+        mt = (self._env("WAKE_SHERPA_MODEL_TYPE", "").strip().lower())
+        if not mt:
+            raise RuntimeError("WAKE_SHERPA_MODEL_TYPE（またはSHERPA_MODEL_TYPE）が未設定です")
+        tokens = self._env("WAKE_SHERPA_TOKENS")
+        model = self._env("WAKE_SHERPA_MODEL")
+        enc = self._env("WAKE_SHERPA_ENCODER")
+        dec = self._env("WAKE_SHERPA_DECODER")
+        join = self._env("WAKE_SHERPA_JOINER")
+        num_threads = int(self._env("WAKE_SHERPA_NUM_THREADS", "1"))
+        provider = self._env("WAKE_SHERPA_PROVIDER", "cpu")
+        language = self._env("WAKE_SHERPA_LANGUAGE", "auto") or "auto"
+        task = self._env("WAKE_SHERPA_TASK", "transcribe") or "transcribe"
+
+        # Prefer Python wrapper classmethods first (sherpa-onnx >=1.10)
+        OR = getattr(so, "OfflineRecognizer", None)
+        if OR is None:
+            raise RuntimeError("sherpa_onnx.OfflineRecognizer が見つかりません")
+
+        try:
+            if mt == "whisper" and hasattr(OR, "from_whisper"):
+                if not (enc and dec):
+                    raise RuntimeError("Whisperの設定不足（ENCODER/DECODER）")
+                lang = language
+                if (lang or "").lower() in {"", "auto", "autodetect", "auto_detect"}:
+                    # sherpa-onnx whisper does not accept 'auto'; default to Japanese here.
+                    lang = "ja"
+                    logger.warning("Whisper言語が'auto'のため'ja'に設定しました。WAKE_SHERPA_LANGUAGEで変更できます。")
+                self.recognizer = OR.from_whisper(
+                    encoder=enc,
+                    decoder=dec,
+                    tokens=tokens or "",
+                    language=lang,
+                    task=task,
+                    num_threads=num_threads,
+                    provider=provider,
+                )
+                return
+            if mt == "paraformer" and hasattr(OR, "from_paraformer"):
+                if not (model and tokens):
+                    raise RuntimeError("Paraformerの設定不足（MODEL/TOKENS）")
+                self.recognizer = OR.from_paraformer(
+                    paraformer=model,
+                    tokens=tokens or "",
+                    num_threads=num_threads,
+                    provider=provider,
+                )
+                return
+            if mt == "transducer" and hasattr(OR, "from_transducer"):
+                if not (enc and dec and join and tokens):
+                    raise RuntimeError("Transducerの設定不足（ENCODER/DECODER/JOINER/TOKENS）")
+                self.recognizer = OR.from_transducer(
+                    encoder=enc,
+                    decoder=dec,
+                    joiner=join,
+                    tokens=tokens or "",
+                    num_threads=num_threads,
+                    provider=provider,
+                )
+                return
+        except Exception:
+            # Fall through to config-based initialization
+            pass
+
+        # Config-based initialization for other versions
+        OfflineModelConfig = getattr(so, "OfflineModelConfig", None)
+        if OfflineModelConfig is None:
+            raise RuntimeError("sherpa_onnx.OfflineModelConfig が見つかりません")
+        Para = getattr(so, "OfflineParaformerModelConfig", None)
+        Trans = getattr(so, "OfflineTransducerModelConfig", None)
+        Whisp = getattr(so, "OfflineWhisperModelConfig", None)
+
+        kwargs = {
+            "tokens": tokens or "",
+            "num_threads": num_threads,
+            "provider": provider,
+        }
+        if mt == "paraformer":
+            if not (model and tokens and Para):
+                raise RuntimeError("Paraformerの設定不足（MODEL/TOKENS）")
+            kwargs["paraformer"] = Para(model=model)
+        elif mt == "transducer":
+            if not (enc and dec and join and tokens and Trans):
+                raise RuntimeError("Transducerの設定不足（ENCODER/DECODER/JOINER/TOKENS）")
+            kwargs["transducer"] = Trans(encoder=enc, decoder=dec, joiner=join)
+        else:  # whisper
+            if not (enc and dec and Whisp):
+                raise RuntimeError("Whisperの設定不足（ENCODER/DECODER）")
+            try:
+                kwargs["whisper"] = Whisp(encoder=enc, decoder=dec, language=language, task=task)
+            except TypeError:
+                kwargs["whisper"] = Whisp(encoder=enc, decoder=dec)
+
+        OfflineRecognizer = getattr(so, "OfflineRecognizer")
+        RecognizerCfg = getattr(so, "OfflineRecognizerConfig", None)
+        ModelCfg = getattr(so, "OfflineModelConfig")
+        decoding = os.getenv("WAKE_SHERPA_DECODING_METHOD", os.getenv("SHERPA_DECODING_METHOD", "greedy_search"))
+
+        # Try 1: create_offline_recognizer/ from_config/ constructor patterns
+        if RecognizerCfg is not None:
+            rec_cfg = RecognizerCfg(model_config=ModelCfg(**kwargs), decoding_method=decoding)
+            factory = getattr(so, "create_offline_recognizer", None)
+            if factory is not None:
+                try:
+                    self.recognizer = factory(rec_cfg)  # type: ignore[misc]
+                    return
+                except Exception:
+                    pass
+            if hasattr(OfflineRecognizer, "from_config"):
+                try:
+                    self.recognizer = OfflineRecognizer.from_config(rec_cfg)  # type: ignore[attr-defined]
+                    return
+                except Exception:
+                    pass
+            try:
+                # Some versions may accept calling via the wrapper
+                self.recognizer = OfflineRecognizer(rec_cfg)
+                return
+            except TypeError:
+                pass
+
+        # Try 2: Pass model_config directly as kwargs
+        try:
+            self.recognizer = OfflineRecognizer(model_config=ModelCfg(**kwargs), decoding_method=decoding)
+            return
+        except TypeError:
+            pass
+
+        # Try 3: Legacy positional model config
+        try:
+            self.recognizer = OfflineRecognizer(ModelCfg(**kwargs))
+            return
+        except TypeError as e:
+            raise RuntimeError("sherpa-onnx OfflineRecognizer の初期化に失敗しました。互換のあるバージョンへ変更してください。") from e
+
+    def reset(self):
+        self.text_history.clear()
+        self.last_text = ""
+        self._last_decode_t = 0.0
+        self._pcm_buffer = np.zeros(0, dtype=np.int16)
+
     def process_audio(self, pcm_data: bytes) -> bool:
-        """オーディオを処理してWake Wordを検出"""
-        current_time = time.time()
-        
-        # 音声認識
-        if self.recognizer.AcceptWaveform(pcm_data):
-            result = json.loads(self.recognizer.Result())
-            text = result.get("text", "")
-            if text:
-                self.text_history.append((text, current_time))
-                logger.debug(f"認識: {text}")
-        else:
-            # 部分結果も取得
-            partial_result = json.loads(self.recognizer.PartialResult())
-            partial_text = partial_result.get("partial", "")
-            if partial_text:
-                self.text_history.append((partial_text, current_time))
-                logger.debug(f"部分認識: {partial_text}")
-        
-        # 古いエントリを削除
-        cutoff_time = current_time - wake_config.WAKE_TIMEOUT_S - 0.5
+        # バッファに追記し、最大で (WAKE_TIMEOUT_S + 0.5)s を保持
+        pcm = np.frombuffer(pcm_data, dtype=np.int16)
+        if pcm.size:
+            self._pcm_buffer = np.concatenate([self._pcm_buffer, pcm])
+            max_len = int((wake_config.WAKE_TIMEOUT_S + 0.5) * audio_config.SAMPLE_RATE)
+            if self._pcm_buffer.size > max_len:
+                self._pcm_buffer = self._pcm_buffer[-max_len:]
+
+        now = time.time()
+        # デコードは700ms間隔で実行（負荷抑制）
+        if now - self._last_decode_t >= 0.7 and self._pcm_buffer.size > 0:
+            # int16 -> float32 [-1,1]
+            f32 = (self._pcm_buffer.astype(np.float32) / 32768.0).copy()
+            stream = self.recognizer.create_stream()
+            stream.accept_waveform(audio_config.SAMPLE_RATE, f32)
+            self.recognizer.decode_stream(stream)
+            text = getattr(stream.result, "text", "") or ""
+            if text and text != self.last_text:
+                self.text_history.append((text, now))
+                self.last_text = text
+            self._last_decode_t = now
+
+        cutoff_time = now - wake_config.WAKE_TIMEOUT_S - 0.5
         self.text_history = [(t, ts) for t, ts in self.text_history if ts >= cutoff_time]
-        
-        # Wake Word検出
         return self._check_wake_words()
-    
+
     def _check_wake_words(self) -> bool:
-        """Wake Wordが含まれているかチェック"""
         current_time = time.time()
-        recent_text = "".join([
-            text for text, timestamp in self.text_history
-            if current_time - timestamp <= wake_config.WAKE_TIMEOUT_S
-        ])
-        
-        # Wake Wordが含まれているかチェック（順序も考慮）
-        if wake_config.WAKE_REQUIRE_BOTH:
-            # 「もしもし」→「サイテク系」の順を優先
-            ok = bool(re.search(r"もしもし.*(サイテク|さいてく|ｻｲﾃｸ|さいテク|サイテック|サイトク|さいとく)", recent_text))
-        else:
-            ok = any(re.search(pattern, recent_text) for _, pattern in wake_config.WAKE_WORDS)
+        recent_text = recent_text_from_history(self.text_history, current_time, wake_config.WAKE_TIMEOUT_S)
+        ok = is_wake_in_text(recent_text, require_both=wake_config.WAKE_REQUIRE_BOTH)
         if ok:
-            logger.info(f"Wake Word検出: {recent_text}")
+            logger.info(f"Wake Word検出: {squash_repeated_tokens(recent_text)}")
         return ok
 
 # ========== 音声録音 ==========
@@ -332,7 +466,7 @@ def save_wav(pcm_data: np.ndarray, filepath: str):
         wf.setnchannels(audio_config.CHANNELS)
         wf.setsampwidth(2)  # int16
         wf.setframerate(audio_config.SAMPLE_RATE)
-    wf.writeframes(pcm_data.tobytes())
+        wf.writeframes(pcm_data.tobytes())
 
 def _dbfs(pcm: np.ndarray) -> float:
     """簡易dBFS計算 (int16想定)"""
@@ -360,6 +494,35 @@ def stt_offline_vosk(pcm_data: np.ndarray) -> str:
     logger.info(f"オフラインSTT結果: {text}")
     return text
 
+# ========== 便利関数（通知音） ==========
+def _fade_in_out(signal: np.ndarray, fade_ratio: float = 0.05) -> np.ndarray:
+    n = len(signal)
+    if n == 0:
+        return signal
+    fr = max(1, int(n * fade_ratio))
+    window = np.ones(n, dtype=np.float32)
+    window[:fr] = np.linspace(0.0, 1.0, fr, dtype=np.float32)
+    window[-fr:] = np.linspace(1.0, 0.0, fr, dtype=np.float32)
+    return (signal * window).astype(np.float32)
+
+def play_wake_sound():
+    """簡単な二音『ポロン』通知音を再生"""
+    try:
+        sr = audio_config.SAMPLE_RATE
+        # 880Hz -> 660Hz の二音（各90ms）
+        dur1 = 0.09
+        dur2 = 0.09
+        t1 = np.linspace(0, dur1, int(sr * dur1), endpoint=False)
+        t2 = np.linspace(0, dur2, int(sr * dur2), endpoint=False)
+        tone1 = 0.2 * np.sin(2 * np.pi * 880 * t1).astype(np.float32)
+        tone2 = 0.2 * np.sin(2 * np.pi * 660 * t2).astype(np.float32)
+        signal = np.concatenate([_fade_in_out(tone1), _fade_in_out(tone2)])
+        sd.play(signal, samplerate=sr, device=audio_config.OUTPUT_DEVICE, blocking=True)
+    except Exception as e:
+        logger.warning(f"通知音の再生に失敗: {e}")
+
+    
+
 # ========== オフラインLLM ==========
 def llm_local_reply(prompt: str, interaction_id: str = "") -> str:
     """ローカルLLMを使用した応答生成"""
@@ -377,8 +540,9 @@ def llm_local_reply(prompt: str, interaction_id: str = "") -> str:
                 "content": prompt
             }
         ],
-        "temperature": 0.7,
-        "max_tokens": 256
+        "temperature": server_config.LLM_TEMPERATURE,
+        "max_tokens": server_config.LLM_MAX_TOKENS,
+        "top_p": server_config.LLM_TOP_P
     }
     
     try:
@@ -398,6 +562,98 @@ def llm_local_reply(prompt: str, interaction_id: str = "") -> str:
     except Exception as e:
         logger.error(f"ローカルLLMエラー: {e}")
         return f"申し訳ありません、応答を生成できませんでした。入力: {prompt}"
+
+def llm_streaming_chat_api(prompt: str, interaction_id: str = "") -> str:
+    """外部Chat API（OpenAI互換）のストリーミングで応答を取得して逐次表示する。
+    利用条件: CHAT_API_BASE_URL, CHAT_API_KEY が設定されていること。
+    失敗時は例外を投げる（呼び出し側でフォールバック）。
+    """
+    if not server_config.CHAT_API_BASE_URL or not server_config.CHAT_API_KEY:
+        raise RuntimeError("Chat API設定が不足しています")
+
+    base = server_config.CHAT_API_BASE_URL.rstrip("/")
+    def build_url(b: str, path: str = "/chat/completions") -> str:
+        return b.rstrip("/") + path
+    url = build_url(base, "/chat/completions")
+    headers = {
+        "Authorization": f"Bearer {server_config.CHAT_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    if interaction_id:
+        headers["X-Interaction-ID"] = interaction_id
+
+    payload = {
+        "model": server_config.CHAT_API_MODEL,
+        "messages": [
+            {"role": "system", "content": "あなたは『サイテク』というアシスタントです。日本語で簡潔に答えてください。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": server_config.LLM_TEMPERATURE,
+        "max_tokens": server_config.LLM_MAX_TOKENS,
+        "top_p": server_config.LLM_TOP_P,
+        "stream": True,
+    }
+
+    print("🌀 ストリーミング応答: ", end="", flush=True)
+    full = []
+    def stream_once(u: str) -> None:
+        with requests.post(u, json=payload, headers=headers, stream=True, timeout=(5, server_config.REQUEST_TIMEOUT)) as r:
+            r.raise_for_status()
+            for raw in r.iter_lines(decode_unicode=True):
+                if raw is None or raw == "":
+                    continue
+                line = raw.strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                except Exception:
+                    continue
+                choices = obj.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                piece = delta.get("content")
+                if piece is None:
+                    piece = choices[0].get("text")
+                if not piece:
+                    continue
+                print(piece, end="", flush=True)
+                full.append(piece)
+
+    tried_alt = False
+    try:
+        stream_once(url)
+    except requests.HTTPError as http_err:
+        status = getattr(http_err.response, 'status_code', None)
+        # 404/405などの場合、/v1 の有無を切り替えて再試行
+        if status in (404, 405):
+            tried_alt = True
+            base2 = base
+            if base2.rstrip('/').endswith('/v1'):
+                base2 = base2.rstrip('/').rsplit('/v1', 1)[0]
+            else:
+                base2 = base2.rstrip('/') + '/v1'
+            alt_url = build_url(base2, "/chat/completions")
+            logger.warning(f"Chat API 404/405: {status}. 別パスで再試行: {alt_url}")
+            try:
+                stream_once(alt_url)
+            except requests.HTTPError as http_err2:
+                status2 = getattr(http_err2.response, 'status_code', None)
+                # まだダメなら /responses も試す
+                alt2 = build_url(base, "/responses")
+                logger.warning(f"Chat API 再試行失敗: {status2}. 代替パスで再試行: {alt2}")
+                stream_once(alt2)
+        else:
+            raise
+    finally:
+        print()
+    reply = "".join(full).strip()
+    logger.info(f"ストリーミング応答 終了 len={len(reply)}")
+    return reply
 
 # ========== サーバー通信 ==========
 def send_to_server(audio_data: np.ndarray, interaction_id: str) -> Tuple[bool, Optional[dict]]:
@@ -463,16 +719,37 @@ def main():
     print(f"🎙  Wake Word待機中: 「もしもしサイテク」")
     print(f"📡 サーバー: {server_config.REMOTE_URL}")
     print(f"🔧 オフラインモード: {'有効' if server_config.LOCAL_STT_ENABLED else '無効'}")
-    logger.info(f"設定: REMOTE_URL={server_config.REMOTE_URL}, LOCAL_STT_ENABLED={server_config.LOCAL_STT_ENABLED}, LOCAL_LLM_URL={server_config.LOCAL_LLM_URL}, REQUEST_TIMEOUT={server_config.REQUEST_TIMEOUT}s")
+    logger.info(
+        f"設定: REMOTE_URL={server_config.REMOTE_URL}, LOCAL_STT_ENABLED={server_config.LOCAL_STT_ENABLED}, "
+        f"LOCAL_LLM_URL={server_config.LOCAL_LLM_URL}, REQUEST_TIMEOUT={server_config.REQUEST_TIMEOUT}s, "
+        f"PREFER_CHAT_API={server_config.PREFER_CHAT_API}, CHAT_API_BASE_URL={server_config.CHAT_API_BASE_URL or '-'}"
+    )
     print("="*50 + "\n")
     
     # オーディオプロセッサ初期化
     audio_processor = AudioProcessor()
-    wake_detector = WakeWordDetector(vosk_model)
+    # Wake検出器（sherpa専用）
+    try:
+        wake_detector = SherpaWakeWordDetector()
+        logger.info("Wakeバックエンド: SherpaWakeWordDetector")
+    except Exception as e:
+        logger.error(f"sherpaのWake初期化に失敗しました: {e}")
+        logger.error(".envの WAKE_SHERPA_* 設定とモデルパスをご確認ください。")
+        sys.exit(1)
     speech_recorder = SpeechRecorder(audio_processor)
     
     # オーディオストリーム開始
     audio_processor.start_stream()
+    # ローカルSTTエンジン（sherpa専用）
+    stt_backend = os.getenv("LOCAL_STT_BACKEND", "sherpa")
+    try:
+        local_stt = create_local_stt_engine(stt_backend, None)
+        stt_name = local_stt.__class__.__name__
+        logger.info(f"ローカルSTTバックエンド: {stt_name}")
+    except Exception as e:
+        logger.error(f"ローカルSTT初期化エラー: {e}")
+        logger.error(".env の SHERPA_* 設定とモデルパスをご確認ください。")
+        sys.exit(1)
     
     try:
         while True:
@@ -481,7 +758,7 @@ def main():
             wake_detector.reset()
             audio_processor.clear_queue()
             
-            min_db = float(os.getenv("WAKE_MIN_DBFS", "-55"))
+            min_db = float(os.getenv("WAKE_MIN_DBFS", "-60"))
             while True:
                 pcm = audio_processor.get_audio_frame(timeout=1.0)
                 if pcm is None:
@@ -514,6 +791,10 @@ def main():
                     print("\n✅ Wake Word検出!")
                     print(f"🆔 ID: {interaction_id}")
                     logger.info(f"[{interaction_id}] Wake Word検出")
+                    # 通知音を鳴らし、回り込み対策でしばらく入力無視
+                    beep_len = 0.18
+                    audio_processor.squelch(beep_len + 0.15)
+                    play_wake_sound()
                     print("📢 お話しください...")
                     break
             
@@ -542,37 +823,79 @@ def main():
                 # オンライン処理成功
                 print("\n" + "-"*40)
                 print(f"🆔 ID: {response.get('interaction_id', interaction_id)}")
-                print("📝 認識結果:", response.get("transcript", ""))
-                print("🤖 応答:", response.get("reply", ""))
+                transcript_raw = response.get("transcript", "")
+                transcript = dedupe_transcript(transcript_raw)
+                print("📝 認識結果:", transcript)
+
+                used_stream = False
+                reply_text = response.get("reply", "")
+                # Chat APIが使えるならストリーミング優先
+                used_stream = False
+                if server_config.PREFER_CHAT_API and server_config.CHAT_API_BASE_URL and server_config.CHAT_API_KEY:
+                    try:
+                        reply_text = llm_streaming_chat_api(transcript, interaction_id)
+                        used_stream = True
+                    except Exception as e:
+                        logger.warning(f"ストリーミングAPI利用に失敗: {e}. サーバー応答/ローカルへフォールバックします。")
+                # ストリーミング結果が空の場合はサーバー応答にフォールバック
+                if used_stream and (not reply_text) and response.get("reply"):
+                    reply_text = response.get("reply")
+                    used_stream = False
+                # 最終出力
+                print("🤖 応答:", reply_text)
                 # サーバー計測があれば表示
                 timings = response.get("timings", {})
                 if timings:
-                    print(f"⏱ サーバー処理: STT {timings.get('stt','-')}s, LLM {timings.get('llm','-')}s, TOTAL {timings.get('total','-')}s")
+                    if used_stream:
+                        print(f"⏱ サーバー処理: STT {timings.get('stt','-')}s, LLM(chat-api stream) -, TOTAL {timings.get('total','-')}s")
+                    else:
+                        print(f"⏱ サーバー処理: STT {timings.get('stt','-')}s, LLM {timings.get('llm','-')}s, TOTAL {timings.get('total','-')}s")
                 else:
                     print(f"⏱ オンライン往復: {online_dur:.2f}s")
                 print("-"*40 + "\n")
-                logger.info(f"[{interaction_id}] オンライン成功 roundtrip={online_dur:.2f}s transcript_len={len(response.get('transcript',''))} reply_len={len(response.get('reply',''))}")
+                logger.info(f"[{interaction_id}] オンライン成功 roundtrip={online_dur:.2f}s transcript_len={len(transcript)} reply_len={len(reply_text)} stream_used={used_stream}")
             else:
                 # オフラインフォールバック
                 if server_config.LOCAL_STT_ENABLED:
                     print("🔄 オフラインモードで処理中...")
                     # オフラインSTT
                     t0 = time.perf_counter()
-                    text = stt_offline_vosk(audio_data)
+                    text = local_stt.transcribe(audio_data, audio_config.SAMPLE_RATE)
+                    text = dedupe_transcript(text)
                     t1 = time.perf_counter()
                     
                     if text:
-                        # オフラインLLM
-                        reply = llm_local_reply(text, interaction_id)
-                        t2 = time.perf_counter()
-                        
+                        # 応答生成（Chat API優先。不可ならローカルLLM）
+                        used_stream = False
+                        t2 = t1
+                        reply = ""
+                        if server_config.PREFER_CHAT_API and server_config.CHAT_API_BASE_URL and server_config.CHAT_API_KEY:
+                            try:
+                                t2a = time.perf_counter()
+                                reply = llm_streaming_chat_api(text, interaction_id)
+                                t2 = time.perf_counter()
+                                used_stream = True
+                            except Exception as e:
+                                logger.warning(f"[offline] ストリーミングAPI失敗: {e}. ローカルLLMにフォールバックします。")
+                        if not used_stream:
+                            reply = llm_local_reply(text, interaction_id)
+                            t2 = time.perf_counter()
+
                         print("\n" + "-"*40)
                         print(f"🆔 ID: {interaction_id}")
                         print("📝 [オフライン] 認識結果:", text)
                         print("🤖 [オフライン] 応答:", reply)
-                        print(f"⏱ [オフライン] STT {t1-t0:.2f}s, LLM {t2-t1:.2f}s, TOTAL {t2-t0:.2f}s")
+                        if used_stream and not reply:
+                            # 空ならローカルにフォールバック
+                            reply = llm_local_reply(text, interaction_id)
+                            t2 = time.perf_counter()
+                            used_stream = False
+                        if used_stream:
+                            print(f"⏱ [オフライン] STT {t1-t0:.2f}s, LLM(chat-api stream) ~{t2-t1:.2f}s, TOTAL {t2-t0:.2f}s")
+                        else:
+                            print(f"⏱ [オフライン] STT {t1-t0:.2f}s, LLM {t2-t1:.2f}s, TOTAL {t2-t0:.2f}s")
                         print("-"*40 + "\n")
-                        logger.info(f"[{interaction_id}] オフライン成功 stt={t1-t0:.2f}s llm={t2-t1:.2f}s total={t2-t0:.2f}s text_len={len(text)} reply_len={len(reply)}")
+                        logger.info(f"[{interaction_id}] オフライン成功 stt={t1-t0:.2f}s llm={(t2-t1):.2f}s total={(t2-t0):.2f}s text_len={len(text)} reply_len={len(reply)} stream={used_stream}")
                     else:
                         print("⚠️  音声を認識できませんでした")
                         logger.warning(f"[{interaction_id}] オフラインSTTでテキストなし")

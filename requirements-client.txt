@@ -1,5 +1,6 @@
-vosk==0.3.44
 sounddevice==0.4.6
 webrtcvad==2.0.10
 numpy==1.24.3
 requests==2.31.0
+python-dotenv==1.0.1
+sherpa-onnx==1.12.9
