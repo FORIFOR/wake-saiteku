@@ -86,8 +86,8 @@ class AudioConfig:
 
 @dataclass
 class WakeConfig:
-    WAKE_TIMEOUT_S: float = float(os.getenv("WAKE_TIMEOUT_S", "2.5"))
-    WAKE_REQUIRE_BOTH: bool = os.getenv("WAKE_REQUIRE_BOTH", "true").lower() == "true"
+    WAKE_TIMEOUT_S: float = float(os.getenv("WAKE_TIMEOUT_S", "4.0"))
+    WAKE_REQUIRE_BOTH: bool = os.getenv("WAKE_REQUIRE_BOTH", "false").lower() == "true"
     WAKE_WORDS: List[Tuple[str, str]] = None
     
     def __post_init__(self):
@@ -107,6 +107,10 @@ class VADConfig:
 @dataclass
 class ServerConfig:
     REMOTE_URL: str = os.getenv("SERVER_URL", "http://127.0.0.1:8000/inference")
+    # Optional alternate URL for quick switching (e.g., legacy<->v1)
+    ALT_URL: str = os.getenv("SERVER_URL_ALT", "")
+    # auto | legacy | v1
+    SERVER_API_MODE: str = os.getenv("SERVER_API_MODE", "auto").strip().lower()
     LOCAL_STT_ENABLED: bool = os.getenv("LOCAL_STT_ENABLED", "true").lower() == "true"
     LOCAL_LLM_URL: str = os.getenv("LLM_LOCAL_URL", "http://127.0.0.1:8081/v1/chat/completions")
     LOCAL_LLM_MODEL: str = os.getenv("LLM_LOCAL_MODEL", "local-model")
@@ -120,6 +124,12 @@ class ServerConfig:
     CHAT_API_BASE_URL: str = os.getenv("CHAT_API_BASE_URL", "")  # 例: http://localhost:8000/v1
     CHAT_API_KEY: str = os.getenv("CHAT_API_KEY", "")
     CHAT_API_MODEL: str = os.getenv("CHAT_API_MODEL", os.getenv("LLM_LOCAL_MODEL", "local-model"))
+    # TTS（任意）
+    ENABLE_TTS_PLAYBACK: bool = os.getenv("ENABLE_TTS_PLAYBACK", "false").lower() == "true"
+    SERVER_TTS_URL: str = os.getenv("SERVER_TTS_URL", "")  # 未指定時は REMOTE_URL から導出
+    TTS_ENGINE: str = os.getenv("TTS_ENGINE", "")  # kokoro_onnx|kokoro_pt|piper|openjtalk など
+    TTS_VOICE: str = os.getenv("TTS_VOICE", "")   # 例: jf_alpha
+    TTS_SAMPLE_RATE: int = int(os.getenv("TTS_SAMPLE_RATE", "24000"))
 
 # 設定インスタンス
 audio_config = AudioConfig()
@@ -157,16 +167,27 @@ class AudioProcessor:
         self._squelch_until = max(self._squelch_until, time.time() + max(0.0, duration_sec))
         
     def start_stream(self):
-        """オーディオストリーム開始"""
+        """オーディオストリーム開始 (t-wada style robust implementation)"""
         if self.stream is None:
-            self.stream = sd.InputStream(
-                channels=audio_config.CHANNELS,
-                samplerate=audio_config.SAMPLE_RATE,
-                dtype=audio_config.DTYPE,
-                blocksize=audio_config.frame_length,
-                device=audio_config.INPUT_DEVICE,
-                callback=self.audio_callback
-            )
+            device_id = self._find_available_input_device()
+            if device_id is None:
+                logger.error("入力デバイスが見つかりません。ダミーストリームモードで起動します。")
+                self._start_dummy_stream()
+                return
+                
+            try:
+                self.stream = sd.InputStream(
+                    channels=audio_config.CHANNELS,
+                    samplerate=audio_config.SAMPLE_RATE,
+                    dtype=audio_config.DTYPE,
+                    blocksize=audio_config.frame_length,
+                    device=device_id,
+                    callback=self.audio_callback
+                )
+            except Exception as e:
+                logger.error(f"オーディオストリーム作成失敗: {e}")
+                self._start_dummy_stream()
+                return
             self.stream.start()
             # デバイス情報を記録
             try:
@@ -181,12 +202,21 @@ class AudioProcessor:
                 logger.info("オーディオストリーム開始")
     
     def stop_stream(self):
-        """オーディオストリーム停止"""
+        """オーディオストリーム停止 (t-wada style robust implementation)"""
         if self.stream:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
-            logger.info("オーディオストリーム停止")
+            if self.stream == "dummy":
+                # ダミーストリームの停止
+                self.stream = None
+                logger.info("🔇 ダミーストリーム停止")
+            else:
+                # 通常のストリーム停止
+                try:
+                    self.stream.stop()
+                    self.stream.close()
+                except Exception as e:
+                    logger.warning(f"⚠️ ストリーム停止エラー: {e}")
+                self.stream = None
+                logger.info("🎤 オーディオストリーム停止")
     
     def get_audio_frame(self, timeout: Optional[float] = None) -> Optional[np.ndarray]:
         """オーディオフレームを取得"""
@@ -202,6 +232,66 @@ class AudioProcessor:
                 self.q.get_nowait()
             except queue.Empty:
                 break
+    
+    def _find_available_input_device(self) -> Optional[int]:
+        """利用可能な入力デバイスを探す (t-wada style)"""
+        try:
+            devices = sd.query_devices()
+            
+            # Test case 1: 設定された入力デバイスの確認
+            if audio_config.INPUT_DEVICE is not None:
+                try:
+                    target_device = int(audio_config.INPUT_DEVICE) if str(audio_config.INPUT_DEVICE).isdigit() else audio_config.INPUT_DEVICE
+                    device_info = sd.query_devices(target_device)
+                    if device_info['max_input_channels'] > 0:
+                        logger.info(f"✅ 設定された入力デバイス使用: [{target_device}] {device_info['name']}")
+                        return target_device
+                    else:
+                        logger.warning(f"⚠️ 設定デバイスは出力専用: [{target_device}] {device_info['name']}")
+                except Exception as e:
+                    logger.warning(f"⚠️ 設定デバイス [{audio_config.INPUT_DEVICE}] 使用不可: {e}")
+            
+            # Test case 2: デフォルト入力デバイスの確認
+            default_input = sd.default.device[0]
+            if default_input != -1 and default_input is not None:
+                try:
+                    device_info = sd.query_devices(default_input)
+                    if device_info['max_input_channels'] > 0:
+                        logger.info(f"✅ デフォルト入力デバイス使用: [{default_input}] {device_info['name']}")
+                        return default_input
+                except Exception as e:
+                    logger.warning(f"⚠️ デフォルト入力デバイス使用不可: {e}")
+            
+            # Test case 3: 利用可能な入力デバイスを順次検索
+            for i, device in enumerate(devices):
+                if device['max_input_channels'] > 0:
+                    logger.info(f"✅ 入力可能デバイス発見: [{i}] {device['name']}")
+                    return i
+            
+            # Test case 4: 入力デバイスが存在しない
+            logger.warning("❌ 入力デバイスが見つかりませんでした")
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ デバイス検索エラー: {e}")
+            return None
+    
+    def _start_dummy_stream(self):
+        """ダミーストリーム開始 (マイクが無い環境でのテスト用)"""
+        logger.info("🔇 ダミーストリームモードで起動（マイク入力無し）")
+        self.stream = "dummy"  # ダミーストリーム指標
+        # 定期的にダミー音声データを生成するスレッドを開始
+        import threading
+        def dummy_audio_generator():
+            while self.stream == "dummy":
+                # 無音データを生成
+                dummy_frame = np.zeros((audio_config.frame_length, audio_config.CHANNELS), dtype=np.int16)
+                self.q.put(dummy_frame)
+                time.sleep(audio_config.FRAME_DUR_MS / 1000.0)
+        
+        self.dummy_thread = threading.Thread(target=dummy_audio_generator, daemon=True)
+        self.dummy_thread.start()
+        logger.info("🤖 ダミー音声データ生成開始")
 
 # ========== Wake Word検知（sherpa-ONNX） ==========
 
@@ -384,6 +474,8 @@ class SherpaWakeWordDetector:
             self.recognizer.decode_stream(stream)
             text = getattr(stream.result, "text", "") or ""
             if text and text != self.last_text:
+                if logger.isEnabledFor(logging.DEBUG) or os.getenv("WAKE_DEBUG_PARTIAL", "").lower() in {"1","true","yes","on"}:
+                    logger.debug(f"Wake partial: {text}")
                 self.text_history.append((text, now))
                 self.last_text = text
             self._last_decode_t = now
@@ -656,6 +748,58 @@ def llm_streaming_chat_api(prompt: str, interaction_id: str = "") -> str:
     return reply
 
 # ========== サーバー通信 ==========
+def _toggle_inference_path(url: str) -> str:
+    """Toggle between legacy '/inference' and '/v1/audio/inference' on the same host."""
+    try:
+        from urllib.parse import urlparse, urlunparse
+        u = urlparse(url)
+        path = u.path.rstrip('/')
+        if path.endswith('/v1/audio/inference'):
+            path = path[: -len('/v1/audio/inference')] + '/inference'
+        elif path.endswith('/inference'):
+            path = path[: -len('/inference')] + '/v1/audio/inference'
+        else:
+            # If ambiguous, prefer v1
+            if not path.endswith('/v1'):
+                path = path + '/v1/audio/inference'
+            else:
+                path = path + '/audio/inference'
+        return urlunparse((u.scheme, u.netloc, path, "", "", ""))
+    except Exception:
+        # Fallback string manipulation
+        if '/v1/audio/inference' in url:
+            return url.replace('/v1/audio/inference', '/inference')
+        if url.endswith('/inference'):
+            return url[:-len('/inference')] + '/v1/audio/inference'
+        return url.rstrip('/') + '/v1/audio/inference'
+
+
+def _iter_candidate_urls() -> List[str]:
+    urls: List[str] = []
+    mode = server_config.SERVER_API_MODE
+    primary = server_config.REMOTE_URL.strip()
+    alt_env = server_config.ALT_URL.strip()
+    if primary:
+        urls.append(primary)
+        if mode == 'auto':
+            urls.append(_toggle_inference_path(primary))
+    if alt_env:
+        if alt_env not in urls:
+            urls.append(alt_env)
+        if mode == 'auto':
+            toggled = _toggle_inference_path(alt_env)
+            if toggled not in urls:
+                urls.append(toggled)
+    # Deduplicate while preserving order
+    seen = set()
+    uniq: List[str] = []
+    for u in urls:
+        if u and u not in seen:
+            uniq.append(u)
+            seen.add(u)
+    return uniq
+
+
 def send_to_server(audio_data: np.ndarray, interaction_id: str) -> Tuple[bool, Optional[dict]]:
     """
     音声データをサーバーに送信
@@ -663,7 +807,8 @@ def send_to_server(audio_data: np.ndarray, interaction_id: str) -> Tuple[bool, O
     Returns:
         (成功フラグ, レスポンスデータ)
     """
-    logger.info(f"サーバーに送信中: {server_config.REMOTE_URL}")
+    candidates = _iter_candidate_urls()
+    logger.info(f"サーバーに送信中: {candidates[0]} (候補={len(candidates)})")
     
     # 一時WAVファイル作成
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
@@ -672,30 +817,45 @@ def send_to_server(audio_data: np.ndarray, interaction_id: str) -> Tuple[bool, O
     try:
         save_wav(audio_data, tmp_path)
         
-        with open(tmp_path, "rb") as f:
-            files = {"file": ("utterance.wav", f, "audio/wav")}
-            response = requests.post(
-                server_config.REMOTE_URL,
-                files=files,
-                headers={
-                    "X-Interaction-ID": interaction_id,
-                    "User-Agent": "WakeSaitekuClient/1.0"
-                },
-                timeout=server_config.REQUEST_TIMEOUT
-            )
-        
-        response.raise_for_status()
-        data = response.json()
-        
-        logger.info("サーバー応答受信成功")
-        return True, data
-        
-    except requests.exceptions.Timeout:
-        logger.error("サーバータイムアウト")
-        return False, None
-        
-    except requests.exceptions.ConnectionError:
-        logger.error("サーバー接続エラー")
+        last_err: Optional[Exception] = None
+        for url in candidates:
+            try:
+                with open(tmp_path, "rb") as f:
+                    files = {"file": ("utterance.wav", f, "audio/wav")}
+                    response = requests.post(
+                        url,
+                        files=files,
+                        headers={
+                            "X-Interaction-ID": interaction_id,
+                            "User-Agent": "WakeSaitekuClient/1.0"
+                        },
+                        timeout=server_config.REQUEST_TIMEOUT
+                    )
+                response.raise_for_status()
+                data = response.json()
+                logger.info(f"サーバー応答受信成功 url={url}")
+                return True, data
+            except requests.exceptions.Timeout as e:
+                logger.warning(f"サーバータイムアウト url={url}")
+                last_err = e
+                continue
+            except requests.exceptions.ConnectionError as e:
+                logger.warning(f"サーバー接続エラー url={url}")
+                last_err = e
+                continue
+            except requests.HTTPError as e:
+                status = getattr(getattr(e, 'response', None), 'status_code', None)
+                logger.warning(f"HTTPエラー url={url} status={status}")
+                last_err = e
+                # try next candidate on 404/405/422 etc.
+                continue
+            except Exception as e:
+                logger.warning(f"サーバー通信例外 url={url} err={e}")
+                last_err = e
+                continue
+        # All candidates failed
+        if last_err:
+            logger.error(f"全URL失敗: {last_err}")
         return False, None
         
     except Exception as e:
@@ -709,6 +869,69 @@ def send_to_server(audio_data: np.ndarray, interaction_id: str) -> Tuple[bool, O
                 os.remove(tmp_path)
             except Exception as e:
                 logger.warning(f"一時ファイル削除エラー: {e}")
+
+
+# ========== サーバーTTS再生（任意） ==========
+def _derive_tts_url_from_inference(inf_url: str) -> str:
+    try:
+        from urllib.parse import urlparse, urlunparse
+        u = urlparse(inf_url)
+        # /inference を /tts に
+        path = u.path
+        if path.endswith("/inference"):
+            path = path[: -len("/inference")] + "/tts"
+        else:
+            if not path.endswith("/"):
+                path = path + "/"
+            path = path + "tts"
+        return urlunparse((u.scheme, u.netloc, path, "", "", ""))
+    except Exception:
+        return inf_url.replace("/inference", "/tts")
+
+
+def speak_via_server_tts(text: str, audio_processor: AudioProcessor) -> None:
+    if not text:
+        return
+    tts_url = server_config.SERVER_TTS_URL.strip() or _derive_tts_url_from_inference(server_config.REMOTE_URL)
+    try:
+        logger.info(f"サーバーTTS要求: {tts_url}")
+        payload = {"text": text}
+        if server_config.TTS_ENGINE:
+            payload["engine"] = server_config.TTS_ENGINE
+        if server_config.TTS_VOICE:
+            payload["voice"] = server_config.TTS_VOICE
+        if server_config.TTS_SAMPLE_RATE:
+            payload["sample_rate"] = int(server_config.TTS_SAMPLE_RATE)
+        r = requests.post(tts_url, json=payload, timeout=server_config.REQUEST_TIMEOUT)
+        if r.status_code != 200 or (r.headers.get("Content-Type") or "").split(";")[0] != "audio/wav":
+            logger.warning(f"サーバーTTS失敗 status={r.status_code} content-type={r.headers.get('Content-Type')}")
+            return
+        data = r.content
+        # WAVをデコード
+        import io as _io
+        import wave as _wave
+
+        with _wave.open(_io.BytesIO(data), "rb") as wf:
+            ch = wf.getnchannels()
+            sr = wf.getframerate()
+            sw = wf.getsampwidth()
+            n = wf.getnframes()
+            raw = wf.readframes(n)
+        if sw != 2:
+            logger.warning(f"TTS WAV サンプル幅が想定外: {sw}bytes")
+            return
+        # int16 -> float32 [-1,1]
+        pcm = np.frombuffer(raw, dtype=np.int16)
+        if ch > 1:
+            pcm = pcm.reshape(-1, ch).mean(axis=1).astype(np.int16, copy=False)
+        audio = (pcm.astype(np.float32) / 32767.0).astype(np.float32, copy=False)
+        dur = len(audio) / float(sr or audio_config.SAMPLE_RATE)
+        # 再生音の回り込み抑制
+        audio_processor.squelch(dur + 0.2)
+        sd.play(audio, samplerate=sr, device=audio_config.OUTPUT_DEVICE, blocking=False)
+        logger.info(f"サーバーTTS再生 len={len(audio)} sr={sr} dur={dur:.2f}s")
+    except Exception as e:
+        logger.warning(f"サーバーTTS再生エラー: {e}")
 
 # ========== メイン処理 ==========
 def main():
@@ -725,6 +948,34 @@ def main():
         f"PREFER_CHAT_API={server_config.PREFER_CHAT_API}, CHAT_API_BASE_URL={server_config.CHAT_API_BASE_URL or '-'}"
     )
     print("="*50 + "\n")
+    
+    # t-wada style TTS疎通テスト
+    if server_config.ENABLE_TTS_PLAYBACK:
+        print("🔊 TTS疎通テスト実行中...")
+        try:
+            test_text = "Wake Saitekuクライアント起動完了。TTSが正常に動作しています。"
+            tts_url = server_config.SERVER_TTS_URL
+            payload = {"text": test_text}
+            if server_config.TTS_ENGINE:
+                payload["engine"] = server_config.TTS_ENGINE
+            if server_config.TTS_SAMPLE_RATE:
+                payload["sample_rate"] = int(server_config.TTS_SAMPLE_RATE)
+            
+            r = requests.post(tts_url, json=payload, timeout=5)
+            if r.status_code == 200 and (r.headers.get("Content-Type") or "").split(";")[0] == "audio/wav":
+                print("✅ TTSサーバー接続成功")
+                # 音声再生テスト
+                import io as _io
+                import wave as _wave
+                with _wave.open(_io.BytesIO(r.content), "rb") as wf:
+                    audio = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32) / 32767.0
+                    sd.play(audio, samplerate=wf.getframerate(), device=audio_config.OUTPUT_DEVICE, blocking=False)
+                    logger.info("✅ TTS初期化テスト完了")
+                    time.sleep(1)  # 音声再生待機
+            else:
+                logger.warning(f"⚠️ TTSテスト失敗: status={r.status_code}")
+        except Exception as e:
+            logger.warning(f"⚠️ TTSテストエラー (続行可能): {e}")
     
     # オーディオプロセッサ初期化
     audio_processor = AudioProcessor()
@@ -758,7 +1009,7 @@ def main():
             wake_detector.reset()
             audio_processor.clear_queue()
             
-            min_db = float(os.getenv("WAKE_MIN_DBFS", "-60"))
+            min_db = float(os.getenv("WAKE_MIN_DBFS", "-75"))
             while True:
                 pcm = audio_processor.get_audio_frame(timeout=1.0)
                 if pcm is None:
@@ -843,13 +1094,26 @@ def main():
                     used_stream = False
                 # 最終出力
                 print("🤖 応答:", reply_text)
+                # 任意: サーバーTTSで応答を読み上げ
+                if server_config.ENABLE_TTS_PLAYBACK and reply_text:
+                    speak_via_server_tts(reply_text, audio_processor)
                 # サーバー計測があれば表示
                 timings = response.get("timings", {})
                 if timings:
-                    if used_stream:
-                        print(f"⏱ サーバー処理: STT {timings.get('stt','-')}s, LLM(chat-api stream) -, TOTAL {timings.get('total','-')}s")
+                    # Normalize to seconds whether server returns *_ms or seconds
+                    if any(k.endswith('_ms') for k in timings.keys()):
+                        asr = timings.get('asr_ms'); llm = timings.get('llm_ms'); total = timings.get('total_ms')
+                        asr_s = (asr/1000.0) if isinstance(asr, (int, float)) else '-'
+                        llm_s = (llm/1000.0) if isinstance(llm, (int, float)) else '-'
+                        total_s = (total/1000.0) if isinstance(total, (int, float)) else '-'
                     else:
-                        print(f"⏱ サーバー処理: STT {timings.get('stt','-')}s, LLM {timings.get('llm','-')}s, TOTAL {timings.get('total','-')}s")
+                        asr_s = timings.get('stt', '-')
+                        llm_s = timings.get('llm', '-')
+                        total_s = timings.get('total', '-')
+                    if used_stream:
+                        print(f"⏱ サーバー処理: STT {asr_s}s, LLM(chat-api stream) -, TOTAL {total_s}s")
+                    else:
+                        print(f"⏱ サーバー処理: STT {asr_s}s, LLM {llm_s}s, TOTAL {total_s}s")
                 else:
                     print(f"⏱ オンライン往復: {online_dur:.2f}s")
                 print("-"*40 + "\n")

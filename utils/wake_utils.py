@@ -1,8 +1,9 @@
+import os
 import re
 from typing import List, Tuple, Optional
 
 
-DEFAULT_ALT_REGEX = r"(サイテク|さいてく|ｻｲﾃｸ|さいテク|サイテック|サイトク|さいとく)"
+DEFAULT_ALT_REGEX = r"(サイテク|さいてく|さいてっく|ｻｲﾃｸ|さいテク|サイテック|サイトク|さいとく)"
 
 
 def recent_text_from_history(text_history: List[Tuple[str, float]], now: float, window_sec: float) -> str:
@@ -10,7 +11,17 @@ def recent_text_from_history(text_history: List[Tuple[str, float]], now: float, 
     return "".join(text for text, ts in text_history if now - ts <= window_sec)
 
 
-def is_wake_in_text(text: str, require_both: bool = True, alt_regex: str = DEFAULT_ALT_REGEX) -> bool:
+def _effective_alt_regex(alt_regex: Optional[str]) -> str:
+    """環境変数 WAKE_ALT_REGEX があればそれを優先し、
+    明示引数があればそれを使用。なければデフォルト。
+    """
+    if alt_regex:
+        return alt_regex
+    env = os.getenv("WAKE_ALT_REGEX")
+    return env if env else DEFAULT_ALT_REGEX
+
+
+def is_wake_in_text(text: str, require_both: bool = True, alt_regex: Optional[str] = None) -> bool:
     """テキスト中にWake Wordが含まれるかを判定。
 
     - require_both=True の場合: 「もしもし」に続いて alt_regex にマッチがあること。
@@ -18,26 +29,28 @@ def is_wake_in_text(text: str, require_both: bool = True, alt_regex: str = DEFAU
     """
     if not text:
         return False
+    alt = _effective_alt_regex(alt_regex)
     if require_both:
-        pattern = rf"もしもし.*{alt_regex}"
+        pattern = rf"もしもし.*{alt}"
         return re.search(pattern, text) is not None
-    return (re.search(r"もしもし", text) is not None) or (re.search(alt_regex, text) is not None)
+    return (re.search(r"もしもし", text) is not None) or (re.search(alt, text) is not None)
 
 
-def find_wake_match(text: str, require_both: bool = True, alt_regex: str = DEFAULT_ALT_REGEX) -> Optional[str]:
+def find_wake_match(text: str, require_both: bool = True, alt_regex: Optional[str] = None) -> Optional[str]:
     """テキスト中のWake一致部分（スニペット）を返す。なければNone。
     - require_both=True の場合は『もしもし ... サイテク系』の一致区間
     - False の場合は『もしもし』または『サイテク系』の一致区間
     """
     if not text:
         return None
+    alt = _effective_alt_regex(alt_regex)
     if require_both:
-        m = re.search(rf"(もしもし.*?{alt_regex})", text)
+        m = re.search(rf"(もしもし.*?{alt})", text)
         return m.group(1) if m else None
     m1 = re.search(r"(もしもし)", text)
     if m1:
         return m1.group(1)
-    m2 = re.search(rf"({alt_regex})", text)
+    m2 = re.search(rf"({alt})", text)
     return m2.group(1) if m2 else None
 
 

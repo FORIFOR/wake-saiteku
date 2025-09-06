@@ -1,0 +1,11 @@
+default_engine: piper  # fallback to openjtalk if unavailable
+data_dir: ./
+cache_dir: ./cache
+models:
+  piper: ./models/piper
+openjtalk:
+  dict_dir: ${OPENJTALK_DICT_DIR}
+  voice: ${OPENJTALK_VOICE}
+server:
+  host: 0.0.0.0
+  port: 9051

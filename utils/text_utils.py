@@ -37,15 +37,19 @@ def dedupe_transcript(text: str) -> str:
         return text
     parts: List[str] = re.findall(r"[^。！？!?]+[。！？!?]?", text)
     out: List[str] = []
-    prev = None
+    prev_norm = None
     for p in parts:
         p = p.strip()
         if not p:
             continue
-        if prev is not None and p == prev:
+        # Normalize for comparison: drop all whitespace
+        norm = re.sub(r"\s+", "", p)
+        if prev_norm is not None and norm == prev_norm:
             continue
-        out.append(p)
-        prev = p
+        # Normalize output minimally: remove spaces immediately before punctuation
+        p_out = re.sub(r"\s+(?=[。！？!?])", "", p)
+        out.append(p_out)
+        prev_norm = norm
     result = "".join(out)
 
     # 句読点で切れなかった場合でも全文の繰り返しを1回に圧縮

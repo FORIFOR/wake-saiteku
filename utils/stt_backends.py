@@ -213,24 +213,37 @@ class SherpaLocalSTT(BaseLocalSTT):
         return path
 
     def transcribe(self, pcm: np.ndarray, sample_rate: int) -> str:
-        # Use the library's wave reader for robustness
-        tmp = self._save_wav(pcm, sample_rate)
-        try:
-            # read_wave returns (samples: np.ndarray[float32], sample_rate)
-            read_wave = getattr(self.so, "read_wave", None)
-            if read_wave is None:
-                raise RuntimeError("sherpa_onnx.read_wave が見つかりません")
-            audio, sr = read_wave(tmp)
-            stream = self.recognizer.create_stream()
-            stream.accept_waveform(sr, audio)
-            self.recognizer.decode_stream(stream)
-            res = stream.result.text if hasattr(stream, "result") else ""
-            return (res or "").strip()
-        finally:
+        """Transcribe PCM audio using sherpa-onnx OfflineRecognizer.
+
+        Accepts int16 PCM (preferred) or float32 in [-1, 1].
+        Avoids relying on sherpa_onnx.read_wave to improve compatibility
+        across versions; feeds audio directly to the recognizer.
+        """
+        if pcm is None or pcm.size == 0:
+            return ""
+
+        # Ensure mono int16 -> float32 [-1, 1]
+        if pcm.dtype == np.int16:
+            audio = (pcm.astype(np.float32) / 32768.0).copy()
+        elif pcm.dtype == np.float32:
+            audio = pcm
+        else:
+            audio = pcm.astype(np.float32, copy=False)
+            # Heuristic: if values look like int16 range, normalize
+            if audio.max(initial=0) > 1.0 or audio.min(initial=0) < -1.0:
+                audio = audio / 32768.0
+
+        stream = self.recognizer.create_stream()
+        stream.accept_waveform(sample_rate, audio)
+        # Some versions benefit from signalling end-of-input
+        if hasattr(stream, "input_finished"):
             try:
-                os.remove(tmp)
+                stream.input_finished()
             except Exception:
                 pass
+        self.recognizer.decode_stream(stream)
+        res = getattr(getattr(stream, "result", None), "text", "")
+        return (res or "").strip()
 
 
 def _env_bool(name: str, default: bool) -> bool:

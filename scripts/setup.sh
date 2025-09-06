@@ -43,6 +43,45 @@ cd "$PROJECT_ROOT"
 
 echo -e "\n${YELLOW}プロジェクトディレクトリ: $PROJECT_ROOT${NC}"
 
+# 共通ユーティリティ
+sed_inplace() {
+    # Cross-platform sed -i wrapper (macOS/BSD vs GNU)
+    if [ "$OS" == "mac" ]; then
+        sed -i '' -E "$@"
+    else
+        sed -i -E "$@"
+    fi
+}
+
+upsert_env_var() {
+    # upsert_env_var FILE KEY VALUE
+    local file="$1"; shift
+    local key="$1"; shift
+    local value="$1"; shift || true
+    if [ ! -f "$file" ]; then
+        touch "$file"
+    fi
+    if grep -q "^${key}=" "$file"; then
+        sed_inplace "s|^${key}=.*$|${key}=${value}|" "$file"
+    else
+        echo "${key}=${value}" >> "$file"
+    fi
+}
+
+ensure_env_file() {
+    # Ensure .env exists at project root
+    local env_path="$PROJECT_ROOT/.env"
+    if [ ! -f "$env_path" ]; then
+        if [ -f "$PROJECT_ROOT/config/.env.example" ]; then
+            cp "$PROJECT_ROOT/config/.env.example" "$env_path"
+        else
+            touch "$env_path"
+        fi
+        echo -e "${GREEN}✓ .env を作成しました${NC}"
+    fi
+    echo "$env_path"
+}
+
 # ========================================
 # 1. Python仮想環境セットアップ
 # ========================================
@@ -126,33 +165,89 @@ case $install_type in
 esac
 
 # ========================================
-# 4. Voskモデルダウンロード（クライアント用）
+# 4. ローカル音声モデルセットアップ（クライアント用）
 # ========================================
 if [ "$install_type" == "2" ] || [ "$install_type" == "3" ]; then
-    echo -e "\n${YELLOW}[4/5] Vosk日本語モデルをダウンロード中...${NC}"
-    
-    MODELS_DIR="$PROJECT_ROOT/models"
-    mkdir -p "$MODELS_DIR"
-    
-    if [ ! -d "$MODELS_DIR/ja" ]; then
-        cd "$MODELS_DIR"
-        
-        # 軽量モデル（約50MB）
-        echo "軽量日本語モデルをダウンロード中..."
-        curl -L -o ja-small.zip https://alphacephei.com/vosk/models/vosk-model-small-ja-0.22.zip
-        
-        echo "展開中..."
-        unzip -q ja-small.zip
-        mv vosk-model-small-ja-0.22 ja
-        rm ja-small.zip
-        
-        cd "$PROJECT_ROOT"
-        echo -e "${GREEN}✓ Vosk日本語モデルをダウンロードしました${NC}"
-    else
-        echo -e "${GREEN}✓ Vosk日本語モデルは既に存在します${NC}"
-    fi
+    echo -e "\n${YELLOW}[4/5] ローカル音声モデルセットアップ${NC}"
+    echo -e "${YELLOW}どのローカルモデルを準備しますか?${NC}"
+    echo "  1) スキップ（後で手動配置）"
+    echo "  2) Vosk 日本語 小サイズ (~50MB)"
+    echo "  3) sherpa-ONNX Whisper Tiny（多言語, 推奨）"
+    read -p "選択 (1-3): " model_choice
+
+    case $model_choice in
+        2)
+            MODELS_DIR="$PROJECT_ROOT/models"
+            mkdir -p "$MODELS_DIR"
+            if [ ! -d "$MODELS_DIR/ja" ]; then
+                cd "$MODELS_DIR"
+                echo "Vosk日本語モデルをダウンロード中..."
+                set +e
+                curl -fL --retry 3 -o ja-small.zip https://alphacephei.com/vosk/models/vosk-model-small-ja-0.22.zip
+                status=$?
+                set -e
+                if [ $status -ne 0 ]; then
+                    echo -e "${RED}Voskモデルのダウンロードに失敗しました。ネットワークとURLをご確認ください。${NC}"
+                else
+                    echo "展開中..."
+                    unzip -q ja-small.zip
+                    mv vosk-model-small-ja-0.22 ja || true
+                    rm -f ja-small.zip
+                    echo -e "${GREEN}✓ Vosk日本語モデルをダウンロードしました${NC}"
+                fi
+                cd "$PROJECT_ROOT"
+            else
+                echo -e "${GREEN}✓ Vosk日本語モデルは既に存在します${NC}"
+            fi
+            ;;
+        3)
+            S_DIR="$PROJECT_ROOT/models/sherpa/whisper-tiny"
+            mkdir -p "$S_DIR"
+            echo "sherpa-ONNX Whisper Tiny をダウンロード（ベストエフォート）..."
+            # macOSの古いbashでも動く形でURL定義
+            set +e
+            while read -r f url; do
+                [ -z "$f" ] && continue
+                if [ -f "$S_DIR/$f" ]; then
+                    echo "  - $f は既に存在します"
+                    continue
+                fi
+                echo "  - $f を取得: $url"
+                curl -fL --retry 3 -o "$S_DIR/$f" "$url"
+                if [ $? -ne 0 ]; then
+                    echo -e "${YELLOW}    ⚠ $f の取得に失敗しました。手動で配置してください。${NC}"
+                else
+                    echo -e "${GREEN}    ✓ 取得済み${NC}"
+                fi
+            done << 'EOF'
+encoder.onnx https://huggingface.co/csukuangfj/sherpa-onnx-whisper-tiny/resolve/main/tiny-encoder.onnx?download=true
+decoder.onnx https://huggingface.co/csukuangfj/sherpa-onnx-whisper-tiny/resolve/main/tiny-decoder.onnx?download=true
+tokens.txt https://huggingface.co/csukuangfj/sherpa-onnx-whisper-tiny/resolve/main/tiny-tokens.txt?download=true
+EOF
+            set -e
+
+            # .env を作成/更新してパスを設定
+            ENV_PATH=$(ensure_env_file)
+            upsert_env_var "$ENV_PATH" WAKE_BACKEND sherpa
+            upsert_env_var "$ENV_PATH" WAKE_SHERPA_MODEL_TYPE whisper
+            upsert_env_var "$ENV_PATH" WAKE_SHERPA_ENCODER models/sherpa/whisper-tiny/encoder.onnx
+            upsert_env_var "$ENV_PATH" WAKE_SHERPA_DECODER models/sherpa/whisper-tiny/decoder.onnx
+            upsert_env_var "$ENV_PATH" WAKE_SHERPA_TOKENS models/sherpa/whisper-tiny/tokens.txt
+            upsert_env_var "$ENV_PATH" LOCAL_STT_BACKEND auto
+            upsert_env_var "$ENV_PATH" SHERPA_MODEL_TYPE whisper
+            upsert_env_var "$ENV_PATH" SHERPA_ENCODER models/sherpa/whisper-tiny/encoder.onnx
+            upsert_env_var "$ENV_PATH" SHERPA_DECODER models/sherpa/whisper-tiny/decoder.onnx
+            upsert_env_var "$ENV_PATH" SHERPA_TOKENS models/sherpa/whisper-tiny/tokens.txt
+
+            echo -e "${GREEN}✓ sherpa-ONNX Whisper Tiny の設定を .env に反映しました${NC}"
+            echo -e "${YELLOW}注: ダウンロードが失敗したファイルがある場合は、models/sherpa/whisper-tiny に手動配置してください${NC}"
+            ;;
+        *)
+            echo -e "${YELLOW}モデルのダウンロードをスキップします${NC}"
+            ;;
+    esac
 else
-    echo -e "\n${YELLOW}[4/5] サーバーのみのインストールのためVoskモデルをスキップ${NC}"
+    echo -e "\n${YELLOW}[4/5] サーバーのみのインストールのためローカルモデル準備をスキップ${NC}"
 fi
 
 # ========================================

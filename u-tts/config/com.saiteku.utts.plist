@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.saiteku.utts</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>cd $HOME/u-tts && source .venv/bin/activate && UTTSDATA=$HOME/u-tts uvicorn server:app --host 0.0.0.0 --port 9051</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$HOME/u-tts/utts.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>$HOME/u-tts/utts.err.log</string>
+</dict>
+</plist>

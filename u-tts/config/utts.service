@@ -1,0 +1,16 @@
+[Unit]
+Description=Unified TTS Service (UTTS)
+After=network.target
+
+[Service]
+# Adjust user and paths
+User=%i
+WorkingDirectory=%h/u-tts
+Environment=UTTSDATA=%h/u-tts
+Environment=OPENJTALK_DICT_DIR=/var/lib/mecab/dic/open-jtalk/naist-jdic
+Environment=OPENJTALK_VOICE=/usr/share/hts-voice/mei/mei_normal.htsvoice
+ExecStart=%h/u-tts/.venv/bin/uvicorn server:app --host 0.0.0.0 --port 9051
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
