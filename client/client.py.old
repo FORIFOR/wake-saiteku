@@ -34,7 +34,6 @@ if _PROJECT_ROOT not in sys.path:
 from utils.wake_utils import recent_text_from_history, is_wake_in_text, squash_repeated_tokens, find_wake_match
 from utils.text_utils import dedupe_transcript
 from utils.stt_backends import create_local_stt_engine
-from client.audio_device_manager import choose_devices
 
 # .env の自動読み込み（任意）
 try:
@@ -149,12 +148,64 @@ class AudioProcessor:
         self._last_level_log = 0.0
         self.last_frame_time = time.time()
         self._squelch_until = 0.0  # 再生音の取り込み抑制用
+    
+    def _check_bluetooth_profile_macos(self, device_name: str):
+        """macOSでBluetoothプロファイル状態をチェック"""
+        try:
+            import subprocess
+            import platform
+            
+            if platform.system() != 'Darwin':
+                return None
+                
+            # Bluetooth設定情報を取得
+            result = subprocess.run(
+                ['system_profiler', 'SPBluetoothDataType', '-xml'],
+                capture_output=True, text=True, timeout=5
+            )
+            
+            if result.returncode == 0 and 'OpenComm' in result.stdout:
+                logger.info("🔍 macOSでOpenComm2のBluetooth状態を確認中...")
+                
+                # HFPプロファイル利用の提案
+                logger.info("💡 OpenComm2最適化のヒント:")
+                logger.info("   1. macOS「システム設定」→「サウンド」→「入力」でOpenComm2を選択")
+                logger.info("   2. 通話品質優先の場合はHFPプロファイルが自動選択されます")
+                logger.info("   3. 音楽品質優先の場合はA2DPプロファイル（入力不可）になります")
+                
+                return "HFP_SUGGESTED"
+        except Exception as e:
+            logger.debug(f"Bluetoothプロファイル確認エラー: {e}")
+            return None
+        return None
         
     def audio_callback(self, indata, frames, time_info, status):
-        """オーディオコールバック"""
+        """オーディオコールバック (Bluetooth最適化版)"""
         if status:
             logger.warning(f"オーディオステータス: {status}")
         now = time.time()
+        
+        # Bluetoothデバイスの場合、データ品質をチェック
+        if hasattr(self, '_bluetooth_config'):
+            # 完全無音データ（-inf dBFS）の検出
+            try:
+                import numpy as np
+                rms = float(np.sqrt(np.mean((indata.astype(np.float32) / 32768.0) ** 2)))
+                if rms > 1e-7:  # 有効なオーディオデータを検出
+                    if not hasattr(self, '_bt_first_audio_detected'):
+                        self._bt_first_audio_detected = True
+                        logger.info(f"🎤 {self._bluetooth_config}: 初回オーディオデータ検出 (RMS={rms:.6f})")
+                elif hasattr(self, '_bt_first_audio_detected') and frames > 0:
+                    # 無音だが、フレームは届いている
+                    pass
+                else:
+                    # 完全無音かつ初回検出前: Bluetooth接続に問題の可能性
+                    if not hasattr(self, '_bt_silence_warning_shown'):
+                        self._bt_silence_warning_shown = True
+                        logger.warning(f"⚠️ Bluetoothマイクから無音データのみ受信中 - プロファイル確認が必要な場合があります")
+            except Exception as e:
+                pass  # numpy計算エラーは無視
+        
         # 再生音がマイクに回り込むのを抑制（半二重的に無視）
         if now < self._squelch_until:
             # 取り込まないが、最後のフレーム時刻は更新
@@ -168,42 +219,158 @@ class AudioProcessor:
         self._squelch_until = max(self._squelch_until, time.time() + max(0.0, duration_sec))
         
     def start_stream(self):
-        """オーディオストリーム開始"""
+        """オーディオストリーム開始 (t-wada style robust implementation)"""
         if self.stream is None:
+            device_id = self._find_available_input_device()
+            if device_id is None:
+                logger.error("利用可能な入力デバイスが見つかりません。")
+                raise RuntimeError("利用可能な入力デバイスが見つかりません。マイクを接続してください。")
+                
+            # Bluetoothデバイスに最適化された設定で試行
+            device_info = sd.query_devices(device_id)
+            device_name = device_info['name']
+            is_bluetooth = any(bt in device_name.lower() for bt in ['shokz', 'opencomm', 'bluetooth', 'airpods', 'headset'])
+            
+            # Bluetoothデバイス用の最適化設定
+            if is_bluetooth:
+                logger.info(f"🎧 Bluetoothデバイス検出: {device_name} - プロファイル最適化を実行")
+                
+                # OpenComm2専用の詳細設定
+                is_opencomm = 'opencomm' in device_name.lower()
+                
+                # macOSでのBluetoothプロファイル状態確認
+                if is_opencomm:
+                    self._check_bluetooth_profile_macos(device_name)
+                
+                # Bluetoothプロファイルに応じた設定候補を生成
+                bt_configs = []
+                
+                if is_opencomm:
+                    # OpenComm2専用: HFPプロファイル用設定
+                    bt_configs.extend([
+                        {
+                            "name": "OpenComm2 HFP Profile",
+                            "samplerate": 8000,  # HFP標準
+                            "blocksize": 160,    # 20ms @ 8kHz
+                            "latency": 0.05,     # HFP用高めレイテンシ
+                            "channels": 1        # モノラル
+                        },
+                        {
+                            "name": "OpenComm2 HSP Profile",
+                            "samplerate": 16000, # HSP改良版
+                            "blocksize": 320,    # 20ms @ 16kHz
+                            "latency": 0.04,
+                            "channels": 1
+                        }
+                    ])
+                
+                # 汎用Bluetooth設定
+                bt_configs.extend([
+                    {
+                        "name": "Generic Bluetooth",
+                        "samplerate": int(device_info.get('default_samplerate', 16000)),
+                        "blocksize": max(256, int(device_info.get('default_samplerate', 16000) * 0.02)),
+                        "latency": device_info.get('default_low_input_latency', 0.02),
+                        "channels": audio_config.CHANNELS
+                    }
+                ])
+                
+                # 各設定を順次試行
+                stream_created = False
+                for config in bt_configs:
+                    logger.info(f"   試行: {config['name']} - SR={config['samplerate']}Hz, CH={config['channels']}")
+                    
+                    try:
+                        self.stream = sd.InputStream(
+                            channels=config['channels'],
+                            samplerate=config['samplerate'],
+                            dtype=audio_config.DTYPE,
+                            blocksize=config['blocksize'],
+                            device=device_id,
+                            callback=self.audio_callback,
+                            latency=config['latency']
+                        )
+                        # 成功したら設定を記録
+                        audio_config.SAMPLE_RATE = config['samplerate']
+                        audio_config.CHANNELS = config['channels']
+                        self._current_device_name = device_name
+                        self._bluetooth_config = config['name']
+                        logger.info(f"✅ {config['name']}で初期化成功")
+                        stream_created = True
+                        break
+                    except Exception as e:
+                        logger.warning(f"⚠️ {config['name']}失敗: {e}")
+                        continue
+                
+                if not stream_created:
+                    logger.warning(f"⚠️ 全Bluetooth設定失敗 - 標準設定でリトライ")
+                    # 標準設定でフォールバック
+                    self.stream = sd.InputStream(
+                        channels=audio_config.CHANNELS,
+                        samplerate=audio_config.SAMPLE_RATE,
+                        dtype=audio_config.DTYPE,
+                        blocksize=audio_config.frame_length,
+                        device=device_id,
+                        callback=self.audio_callback
+                    )
+            else:
+                # 通常デバイスの場合
+                try:
+                    self.stream = sd.InputStream(
+                        channels=audio_config.CHANNELS,
+                        samplerate=audio_config.SAMPLE_RATE,
+                        dtype=audio_config.DTYPE,
+                        blocksize=audio_config.frame_length,
+                        device=device_id,
+                        callback=self.audio_callback
+                    )
+                except Exception as e:
+                    logger.error(f"オーディオストリーム作成失敗: {e}")
+                    raise RuntimeError(f"オーディオストリーム作成に失敗しました: {e}")
+            # 段階的な安全起動
+            start_attempts = [
+                {"description": "通常起動", "delay": 0.0},
+                {"description": "0.5秒待機後起動", "delay": 0.5},
+                {"description": "1秒待機後起動", "delay": 1.0}
+            ]
+            
+            for attempt in start_attempts:
+                try:
+                    if attempt["delay"] > 0:
+                        logger.info(f"🔄 {attempt['description']}を試行...")
+                        time.sleep(attempt["delay"])
+                    
+                    self.stream.start()
+                    logger.info(f"✅ ストリーム開始成功 ({attempt['description']})")
+                    break
+                except Exception as e:
+                    logger.warning(f"⚠️ {attempt['description']}失敗: {e}")
+                    if attempt == start_attempts[-1]:  # 最後の試行の場合
+                        logger.error(f"❌ 全ての起動方法が失敗。デバイス {device_id}")
+                        self.stream = None
+                        raise RuntimeError(f"オーディオストリーム開始に失敗しました。デバイス {device_id}: {e}")
+            # デバイス情報を記録
             try:
-                self.stream = sd.InputStream(
-                    channels=audio_config.CHANNELS,
-                    samplerate=audio_config.SAMPLE_RATE,
-                    dtype=audio_config.DTYPE,
-                    blocksize=audio_config.frame_length,
-                    # device is taken from sd.default
-                    callback=self.audio_callback
-                )
-                self.stream.start()
-                logger.info(f"オーディオストリーム開始 samplerate={audio_config.SAMPLE_RATE}Hz block={audio_config.frame_length}")
-            except Exception as e:
-                logger.error(f"オーディオストリーム作成失敗: {e}")
-                # sd.default.device[0] が None の可能性もある
-                if sd.default.device[0] is None:
-                    logger.error("入力デバイスが選択されていません。ダミーストリームモードで起動します。")
-                self._start_dummy_stream()
+                in_dev = None
+                if audio_config.INPUT_DEVICE is not None:
+                    in_dev = sd.query_devices(audio_config.INPUT_DEVICE)
+                else:
+                    default_in = sd.default.device[0]
+                    in_dev = sd.query_devices(default_in)
+                logger.info(f"オーディオストリーム開始 device='{in_dev.get('name','unknown')}' samplerate={audio_config.SAMPLE_RATE}Hz block={audio_config.frame_length}")
+            except Exception:
+                logger.info("オーディオストリーム開始")
     
     def stop_stream(self):
         """オーディオストリーム停止 (t-wada style robust implementation)"""
         if self.stream:
-            if self.stream == "dummy":
-                # ダミーストリームの停止
-                self.stream = None
-                logger.info("🔇 ダミーストリーム停止")
-            else:
-                # 通常のストリーム停止
-                try:
-                    self.stream.stop()
-                    self.stream.close()
-                except Exception as e:
-                    logger.warning(f"⚠️ ストリーム停止エラー: {e}")
-                self.stream = None
-                logger.info("🎤 オーディオストリーム停止")
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception as e:
+                logger.warning(f"⚠️ ストリーム停止エラー: {e}")
+            self.stream = None
+            logger.info("🎤 オーディオストリーム停止")
     
     def get_audio_frame(self, timeout: Optional[float] = None) -> Optional[np.ndarray]:
         """オーディオフレームを取得"""
@@ -220,24 +387,49 @@ class AudioProcessor:
             except queue.Empty:
                 break
     
+    def _find_available_input_device(self) -> Optional[int]:
+        """利用可能な入力デバイスを探す (t-wada style)"""
+        try:
+            devices = sd.query_devices()
+            
+            # Test case 1: 設定された入力デバイスの確認
+            if audio_config.INPUT_DEVICE is not None:
+                try:
+                    target_device = int(audio_config.INPUT_DEVICE) if str(audio_config.INPUT_DEVICE).isdigit() else audio_config.INPUT_DEVICE
+                    device_info = sd.query_devices(target_device)
+                    if device_info['max_input_channels'] > 0:
+                        logger.info(f"✅ 設定された入力デバイス使用: [{target_device}] {device_info['name']}")
+                        return target_device
+                    else:
+                        logger.warning(f"⚠️ 設定デバイスは出力専用: [{target_device}] {device_info['name']}")
+                except Exception as e:
+                    logger.warning(f"⚠️ 設定デバイス [{audio_config.INPUT_DEVICE}] 使用不可: {e}")
+            
+            # Test case 2: デフォルト入力デバイスの確認
+            default_input = sd.default.device[0]
+            if default_input != -1 and default_input is not None:
+                try:
+                    device_info = sd.query_devices(default_input)
+                    if device_info['max_input_channels'] > 0:
+                        logger.info(f"✅ デフォルト入力デバイス使用: [{default_input}] {device_info['name']}")
+                        return default_input
+                except Exception as e:
+                    logger.warning(f"⚠️ デフォルト入力デバイス使用不可: {e}")
+            
+            # Test case 3: 利用可能な入力デバイスを順次検索
+            for i, device in enumerate(devices):
+                if device['max_input_channels'] > 0:
+                    logger.info(f"✅ 入力可能デバイス発見: [{i}] {device['name']}")
+                    return i
+            
+            # Test case 4: 入力デバイスが存在しない
+            logger.warning("❌ 入力デバイスが見つかりませんでした")
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ デバイス検索エラー: {e}")
+            return None
     
-    
-    def _start_dummy_stream(self):
-        """ダミーストリーム開始 (マイクが無い環境でのテスト用)"""
-        logger.info("🔇 ダミーストリームモードで起動（マイク入力無し）")
-        self.stream = "dummy"  # ダミーストリーム指標
-        # 定期的にダミー音声データを生成するスレッドを開始
-        import threading
-        def dummy_audio_generator():
-            while self.stream == "dummy":
-                # 無音データを生成
-                dummy_frame = np.zeros((audio_config.frame_length, audio_config.CHANNELS), dtype=np.int16)
-                self.q.put(dummy_frame)
-                time.sleep(audio_config.FRAME_DUR_MS / 1000.0)
-        
-        self.dummy_thread = threading.Thread(target=dummy_audio_generator, daemon=True)
-        self.dummy_thread.start()
-        logger.info("🤖 ダミー音声データ生成開始")
 
 # ========== Wake Word検知（sherpa-ONNX） ==========
 
@@ -555,7 +747,7 @@ def play_wake_sound():
         tone1 = 0.2 * np.sin(2 * np.pi * 880 * t1).astype(np.float32)
         tone2 = 0.2 * np.sin(2 * np.pi * 660 * t2).astype(np.float32)
         signal = np.concatenate([_fade_in_out(tone1), _fade_in_out(tone2)])
-        sd.play(signal, samplerate=sr, blocking=True)
+        sd.play(signal, samplerate=sr, device=audio_config.OUTPUT_DEVICE, blocking=True)
     except Exception as e:
         logger.warning(f"通知音の再生に失敗: {e}")
 
@@ -874,7 +1066,7 @@ def speak_via_server_tts(text: str, audio_processor: AudioProcessor) -> None:
         dur = len(audio) / float(sr or audio_config.SAMPLE_RATE)
         # 再生音の回り込み抑制
         audio_processor.squelch(dur + 0.2)
-        sd.play(audio, samplerate=sr, blocking=False)
+        sd.play(audio, samplerate=sr, device=audio_config.OUTPUT_DEVICE, blocking=False)
         logger.info(f"サーバーTTS再生 len={len(audio)} sr={sr} dur={dur:.2f}s")
     except Exception as e:
         logger.warning(f"サーバーTTS再生エラー: {e}")
@@ -882,33 +1074,6 @@ def speak_via_server_tts(text: str, audio_processor: AudioProcessor) -> None:
 # ========== メイン処理 ==========
 def main():
     """メインループ"""
-    # デバイス確定（TTSテストより前に！）
-    print("⚙️  オーディオデバイスを選択中...")
-    in_idx, out_idx = choose_devices(
-        samplerate=audio_config.SAMPLE_RATE,
-        blocklist=[s.strip().lower() for s in os.getenv("WAKE_AUDIO_BLOCKLIST","").split(",") if s.strip()],
-        allow_interactive=os.getenv("WAKE_AUDIO_SELECT","0").lower() in {"1","true","yes","on"},
-        remember=True,
-        strict_health=True,
-        require_pair_for_bt=None,  # macOSではFalse, その他ではTrueに自動設定
-    )
-    if in_idx is None:
-        logger.error("利用可能な入力デバイスが見つかりませんでした。")
-        sys.exit(1)
-
-    sd.default.device = (in_idx, out_idx if out_idx is not None else -1)
-    sd.default.samplerate = audio_config.SAMPLE_RATE
-    sd.default.channels = (audio_config.CHANNELS, 1)
-    
-    try:
-        dev_in_info = sd.query_devices(in_idx)
-        dev_out_info = sd.query_devices(out_idx) if out_idx is not None else None
-        in_name = dev_in_info['name'] if dev_in_info else 'N/A'
-        out_name = dev_out_info['name'] if dev_out_info else 'N/A'
-        logger.info(f"🎤 Input='{in_name}'  🔊 Output='{out_name}'")
-    except Exception as e:
-        logger.warning(f"選択デバイス情報の取得に失敗: {e}")
-
     print("\n" + "="*50)
     print("Wake Saiteku クライアント")
     print("="*50)
@@ -942,7 +1107,7 @@ def main():
                 import wave as _wave
                 with _wave.open(_io.BytesIO(r.content), "rb") as wf:
                     audio = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32) / 32767.0
-                    sd.play(audio, samplerate=wf.getframerate(), blocking=False)
+                    sd.play(audio, samplerate=wf.getframerate(), device=audio_config.OUTPUT_DEVICE, blocking=False)
                     logger.info("✅ TTS初期化テスト完了")
                     time.sleep(1)  # 音声再生待機
             else:
@@ -986,8 +1151,10 @@ def main():
             while True:
                 pcm = audio_processor.get_audio_frame(timeout=1.0)
                 if pcm is None:
-                    # しばらくフレームが来ない場合はストリームを復帰
-                    if time.time() - audio_processor.last_frame_time > 3.0:
+                    # Bluetoothデバイスの場合はフレーム待機時間を延長
+                    frame_timeout = 10.0 if any(bt in str(getattr(audio_processor, '_current_device_name', '')).lower() 
+                                                for bt in ['shokz', 'opencomm', 'bluetooth']) else 3.0
+                    if time.time() - audio_processor.last_frame_time > frame_timeout:
                         logger.warning("🎤 音声フレームが3秒以上届いていません。ストリームを再起動します。")
                         try:
                             audio_processor.stop_stream()

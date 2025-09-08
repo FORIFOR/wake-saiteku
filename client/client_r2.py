@@ -18,13 +18,19 @@ import logging
 import logging.handlers
 import uuid
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, cast
 from dataclasses import dataclass
 from datetime import datetime
 
 import numpy as np
 import sounddevice as sd
 import webrtcvad
+
+# デバイス安全選択（Bluetooth→USB→既定、対話選択可）
+try:
+    from audio_device_manager import choose_devices
+except Exception:
+    choose_devices = None
 
 # --- プロジェクトルートを import path に追加（python client/client.py 実行対応）
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
@@ -34,7 +40,6 @@ if _PROJECT_ROOT not in sys.path:
 from utils.wake_utils import recent_text_from_history, is_wake_in_text, squash_repeated_tokens, find_wake_match
 from utils.text_utils import dedupe_transcript
 from utils.stt_backends import create_local_stt_engine
-from client.audio_device_manager import choose_devices
 
 # .env の自動読み込み（任意）
 try:
@@ -149,6 +154,12 @@ class AudioProcessor:
         self._last_level_log = 0.0
         self.last_frame_time = time.time()
         self._squelch_until = 0.0  # 再生音の取り込み抑制用
+        # watchdog / failure handling
+        self._watchdog_th = None
+        self._stop_flag = False
+        self._noframe_threshold = float(os.getenv("AUDIO_NOFRAME_SEC", "2.5"))
+        self._restart_backoff = 0.5
+        self._fail_count = 0
         
     def audio_callback(self, indata, frames, time_info, status):
         """オーディオコールバック"""
@@ -166,30 +177,57 @@ class AudioProcessor:
     def squelch(self, duration_sec: float):
         """指定時間、入力フレームを無視（再生音の回り込み対策）"""
         self._squelch_until = max(self._squelch_until, time.time() + max(0.0, duration_sec))
+
+    def _open_stream(self, in_idx: int) -> None:
+        self.stream = sd.InputStream(
+            channels=audio_config.CHANNELS,
+            samplerate=audio_config.SAMPLE_RATE,
+            dtype=audio_config.DTYPE,
+            blocksize=audio_config.frame_length,
+            device=in_idx,
+            callback=self.audio_callback,
+        )
+        self.stream.start()
+        di = sd.query_devices(in_idx)
+        logger.info(
+            f"🎤 オーディオストリーム開始 input='{di.get('name','unknown')}' "
+            f"samplerate={audio_config.SAMPLE_RATE}Hz block={audio_config.frame_length}"
+        )
         
     def start_stream(self):
-        """オーディオストリーム開始"""
-        if self.stream is None:
-            try:
-                self.stream = sd.InputStream(
-                    channels=audio_config.CHANNELS,
-                    samplerate=audio_config.SAMPLE_RATE,
-                    dtype=audio_config.DTYPE,
-                    blocksize=audio_config.frame_length,
-                    # device is taken from sd.default
-                    callback=self.audio_callback
-                )
-                self.stream.start()
-                logger.info(f"オーディオストリーム開始 samplerate={audio_config.SAMPLE_RATE}Hz block={audio_config.frame_length}")
-            except Exception as e:
-                logger.error(f"オーディオストリーム作成失敗: {e}")
-                # sd.default.device[0] が None の可能性もある
-                if sd.default.device[0] is None:
-                    logger.error("入力デバイスが選択されていません。ダミーストリームモードで起動します。")
+        """オーディオストリーム開始（sd.default.device を前提）"""
+        if self.stream is not None:
+            return
+        try:
+            in_idx = cast(tuple, sd.default.device)[0]
+        except Exception:
+            in_idx = None
+        if in_idx in (-1, None):
+            raise RuntimeError("入力デバイスが未設定/無効です。")
+        try:
+            self._open_stream(in_idx)
+        except Exception as e:
+            # ダミーは明示許可時のみ
+            if os.getenv("ALLOW_DUMMY_STREAM", "0").lower() in {"1","true","yes","on"}:
+                logger.error(f"オーディオストリーム作成失敗: {e} → ダミーストリームで継続")
                 self._start_dummy_stream()
+            else:
+                raise
+        # watchdog 起動
+        if self._watchdog_th is None:
+            self._stop_flag = False
+            self._watchdog_th = threading.Thread(target=self._watchdog_loop, daemon=True)
+            self._watchdog_th.start()
     
     def stop_stream(self):
         """オーディオストリーム停止 (t-wada style robust implementation)"""
+        self._stop_flag = True
+        if self._watchdog_th:
+            try:
+                self._watchdog_th.join(timeout=0.5)
+            except Exception:
+                pass
+            self._watchdog_th = None
         if self.stream:
             if self.stream == "dummy":
                 # ダミーストリームの停止
@@ -220,10 +258,17 @@ class AudioProcessor:
             except queue.Empty:
                 break
     
-    
+    # 旧スキャナは廃止（起動時に sd.default に安全デバイスを設定する方針）
+    def _find_available_input_device(self) -> Optional[int]:
+        try:
+            return cast(tuple, sd.default.device)[0]
+        except Exception:
+            return None
     
     def _start_dummy_stream(self):
-        """ダミーストリーム開始 (マイクが無い環境でのテスト用)"""
+        """ダミーストリーム開始（明示許可時のみ）。本番では使わない。"""
+        if os.getenv("ALLOW_DUMMY_STREAM", "0").lower() not in {"1","true","yes","on"}:
+            raise RuntimeError("ダミーストリームは禁止されています（ALLOW_DUMMY_STREAM=1 で明示許可）。")
         logger.info("🔇 ダミーストリームモードで起動（マイク入力無し）")
         self.stream = "dummy"  # ダミーストリーム指標
         # 定期的にダミー音声データを生成するスレッドを開始
@@ -238,6 +283,34 @@ class AudioProcessor:
         self.dummy_thread = threading.Thread(target=dummy_audio_generator, daemon=True)
         self.dummy_thread.start()
         logger.info("🤖 ダミー音声データ生成開始")
+
+    # 監視: フレーム未到着（オーディオ検知失敗）を自動復旧
+    def _watchdog_loop(self):
+        backoff = self._restart_backoff
+        while not self._stop_flag:
+            time.sleep(0.5)
+            if self.stream in (None, "dummy"):
+                continue
+            dt = time.time() - self.last_frame_time
+            if dt > self._noframe_threshold:
+                self._fail_count += 1
+                logger.error(f"audio_detection_failure: no frames for {dt:.1f}s "
+                             f"(fail#{self._fail_count}) → 再起動します")
+                try:
+                    # 再起動（デバイス index は sd.default.device を再利用）
+                    try:
+                        in_idx = cast(tuple, sd.default.device)[0]
+                    except Exception:
+                        in_idx = None
+                    self.stop_stream()
+                    time.sleep(0.2)
+                    if in_idx in (-1, None):
+                        raise RuntimeError("入力デバイスが未設定/喪失しました。")
+                    self._open_stream(in_idx)
+                    backoff = min(backoff * 2, 8.0)  # 上限 8s
+                except Exception as e:
+                    logger.error(f"再起動失敗: {e}")
+                    time.sleep(backoff)
 
 # ========== Wake Word検知（sherpa-ONNX） ==========
 
@@ -555,6 +628,13 @@ def play_wake_sound():
         tone1 = 0.2 * np.sin(2 * np.pi * 880 * t1).astype(np.float32)
         tone2 = 0.2 * np.sin(2 * np.pi * 660 * t2).astype(np.float32)
         signal = np.concatenate([_fade_in_out(tone1), _fade_in_out(tone2)])
+        # 出力デバイス未設定時はスキップ（検出失敗の連鎖を防ぐ）
+        try:
+            out_idx = cast(tuple, sd.default.device)[1]
+        except Exception:
+            out_idx = None
+        if out_idx in (-1, None):
+            return
         sd.play(signal, samplerate=sr, blocking=True)
     except Exception as e:
         logger.warning(f"通知音の再生に失敗: {e}")
@@ -873,7 +953,14 @@ def speak_via_server_tts(text: str, audio_processor: AudioProcessor) -> None:
         audio = (pcm.astype(np.float32) / 32767.0).astype(np.float32, copy=False)
         dur = len(audio) / float(sr or audio_config.SAMPLE_RATE)
         # 再生音の回り込み抑制
-        audio_processor.squelch(dur + 0.2)
+        audio_processor.squelch(dur + 0.2)  # 半二重回り込み対策
+        try:
+            out_idx = cast(tuple, sd.default.device)[1]
+        except Exception:
+            out_idx = None
+        if out_idx in (-1, None):
+            logger.warning("出力デバイス未設定のためTTS再生をスキップ")
+            return
         sd.play(audio, samplerate=sr, blocking=False)
         logger.info(f"サーバーTTS再生 len={len(audio)} sr={sr} dur={dur:.2f}s")
     except Exception as e:
@@ -882,33 +969,6 @@ def speak_via_server_tts(text: str, audio_processor: AudioProcessor) -> None:
 # ========== メイン処理 ==========
 def main():
     """メインループ"""
-    # デバイス確定（TTSテストより前に！）
-    print("⚙️  オーディオデバイスを選択中...")
-    in_idx, out_idx = choose_devices(
-        samplerate=audio_config.SAMPLE_RATE,
-        blocklist=[s.strip().lower() for s in os.getenv("WAKE_AUDIO_BLOCKLIST","").split(",") if s.strip()],
-        allow_interactive=os.getenv("WAKE_AUDIO_SELECT","0").lower() in {"1","true","yes","on"},
-        remember=True,
-        strict_health=True,
-        require_pair_for_bt=None,  # macOSではFalse, その他ではTrueに自動設定
-    )
-    if in_idx is None:
-        logger.error("利用可能な入力デバイスが見つかりませんでした。")
-        sys.exit(1)
-
-    sd.default.device = (in_idx, out_idx if out_idx is not None else -1)
-    sd.default.samplerate = audio_config.SAMPLE_RATE
-    sd.default.channels = (audio_config.CHANNELS, 1)
-    
-    try:
-        dev_in_info = sd.query_devices(in_idx)
-        dev_out_info = sd.query_devices(out_idx) if out_idx is not None else None
-        in_name = dev_in_info['name'] if dev_in_info else 'N/A'
-        out_name = dev_out_info['name'] if dev_out_info else 'N/A'
-        logger.info(f"🎤 Input='{in_name}'  🔊 Output='{out_name}'")
-    except Exception as e:
-        logger.warning(f"選択デバイス情報の取得に失敗: {e}")
-
     print("\n" + "="*50)
     print("Wake Saiteku クライアント")
     print("="*50)
@@ -922,7 +982,45 @@ def main():
     )
     print("="*50 + "\n")
     
-    # t-wada style TTS疎通テスト
+    # === 起動時に安全な入出力デバイスを確定（Bluetooth→USB→既定、必要に応じて対話選択） ===
+    try:
+        allow_interactive = os.getenv("WAKE_AUDIO_SELECT", "0").lower() in {"1","true","yes","on"}
+        extra_block = [s.strip().lower() for s in os.getenv("WAKE_AUDIO_BLOCKLIST","").split(",") if s.strip()]
+        blocklist = ["opencomm2 by shokz", "shokz"] + extra_block
+        if choose_devices:
+            in_idx, out_idx = choose_devices(
+                samplerate=audio_config.SAMPLE_RATE,
+                blocklist=blocklist,
+                allow_interactive=allow_interactive,
+                remember=True,
+            )
+        else:
+            in_idx = sd.default.device[0] if sd.default.device else None
+            out_idx = sd.default.device[1] if sd.default.device else None
+        if in_idx is None:
+            if os.getenv("ALLOW_DUMMY_STREAM", "0").lower() in {"1","true","yes","on"}:
+                logger.warning("入力デバイスが見つかりません。ダミーストリームモードで継続します。")
+                # ダミー用に無効なデバイスIDを設定
+                sd.default.device = (-1, out_idx if out_idx not in (-1, None) else -1)
+                sd.default.samplerate = audio_config.SAMPLE_RATE
+                sd.default.channels = (audio_config.CHANNELS, 1)
+                do = sd.query_devices(out_idx) if out_idx not in (-1, None) else {"name": "なし"}
+                logger.info(f"🎤 Input='ダミー（ALLOW_DUMMY_STREAM有効）'  🔊 Output='{do.get('name','?')}'")
+                return  # ダミーモードで継続
+            else:
+                raise RuntimeError("利用可能な入力デバイスが見つかりません。")
+        else:
+            sd.default.device = (in_idx, out_idx if out_idx is not None else -1)
+            sd.default.samplerate = audio_config.SAMPLE_RATE
+            sd.default.channels = (audio_config.CHANNELS, 1)
+            di = sd.query_devices(in_idx)
+            do = sd.query_devices(out_idx) if out_idx not in (-1, None) else {"name": "なし"}
+            logger.info(f"🎤 Input='{di.get('name','?')}'  🔊 Output='{do.get('name','?')}'")
+    except Exception as e:
+        logger.error(f"オーディオ入出力の初期化に失敗: {e}")
+        raise
+
+    # TTS疎通テスト（任意・出力がある時のみ）
     if server_config.ENABLE_TTS_PLAYBACK:
         print("🔊 TTS疎通テスト実行中...")
         try:
@@ -942,7 +1040,12 @@ def main():
                 import wave as _wave
                 with _wave.open(_io.BytesIO(r.content), "rb") as wf:
                     audio = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32) / 32767.0
-                    sd.play(audio, samplerate=wf.getframerate(), blocking=False)
+                    try:
+                        out_idx = cast(tuple, sd.default.device)[1]
+                    except Exception:
+                        out_idx = None
+                    if out_idx not in (-1, None):
+                        sd.play(audio, samplerate=wf.getframerate(), blocking=False)
                     logger.info("✅ TTS初期化テスト完了")
                     time.sleep(1)  # 音声再生待機
             else:
@@ -962,7 +1065,7 @@ def main():
         sys.exit(1)
     speech_recorder = SpeechRecorder(audio_processor)
     
-    # オーディオストリーム開始
+    # オーディオストリーム開始（失敗時は例外で停止。ダミーは既定で使わない）
     audio_processor.start_stream()
     # ローカルSTTエンジン（sherpa専用）
     stt_backend = os.getenv("LOCAL_STT_BACKEND", "sherpa")

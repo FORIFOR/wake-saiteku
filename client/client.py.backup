@@ -34,7 +34,6 @@ if _PROJECT_ROOT not in sys.path:
 from utils.wake_utils import recent_text_from_history, is_wake_in_text, squash_repeated_tokens, find_wake_match
 from utils.text_utils import dedupe_transcript
 from utils.stt_backends import create_local_stt_engine
-from client.audio_device_manager import choose_devices
 
 # .env の自動読み込み（任意）
 try:
@@ -103,6 +102,7 @@ class VADConfig:
     VAD_MODE: int = int(os.getenv("VAD_MODE", "2"))  # 0-3, 3が最も厳しい
     MIN_UTTERANCE_MS: int = int(os.getenv("MIN_UTTERANCE_MS", "300"))
     END_SILENCE_MS: int = int(os.getenv("END_SILENCE_MS", "800"))
+    HOLD_AFTER_START_MS: int = int(os.getenv("HOLD_AFTER_START_MS", "1200"))
     MAX_RECORDING_MS: int = int(os.getenv("MAX_RECORDING_MS", "10000"))
 
 @dataclass
@@ -149,6 +149,170 @@ class AudioProcessor:
         self._last_level_log = 0.0
         self.last_frame_time = time.time()
         self._squelch_until = 0.0  # 再生音の取り込み抑制用
+        # 解決済みデバイスインデックス（Noneで自動）
+        self._resolved_input: Optional[int] = None
+        self._resolved_output: Optional[int] = None
+
+    def _device_index_by_name(self, name: str, require: str) -> Optional[int]:
+        """名前（部分一致可）と方向('input'/'output')から最適なデバイスindexを返す。"""
+        try:
+            name_l = name.strip().lower()
+            best = []
+            for i, info in enumerate(sd.query_devices()):
+                nm = str(info.get('name', '')).lower()
+                if name_l in nm:
+                    if require == 'input' and info.get('max_input_channels', 0) > 0:
+                        best.append(i)
+                    if require == 'output' and info.get('max_output_channels', 0) > 0:
+                        best.append(i)
+            return best[0] if best else None
+        except Exception:
+            return None
+
+    def _resolve_input_device(self) -> Optional[int]:
+        """入力デバイスを過剰なハンドオフなしに決定（テストで多重オープンしない）。"""
+        # 1) 明示指定（番号 or 名前）
+        val = audio_config.INPUT_DEVICE
+        if val is not None and str(val).strip() != "":
+            s = str(val).strip()
+            if s.isdigit():
+                try:
+                    idx = int(s)
+                    if sd.query_devices(idx).get('max_input_channels', 0) > 0:
+                        return idx
+                except Exception as e:
+                    logger.warning(f"⚠️ 指定入力index無効: {s}: {e}")
+            else:
+                idx = self._device_index_by_name(s, 'input')
+                if idx is not None:
+                    return idx
+                else:
+                    try:
+                        matches = [f"[{i}] {d['name']}" for i, d in enumerate(sd.query_devices()) if s.lower() in str(d.get('name','')).lower()]
+                        if matches:
+                            logger.warning(f"⚠️ 指定名に複数一致: {s}: {', '.join(matches)}")
+                    except Exception:
+                        pass
+        # 2) デフォルト
+        try:
+            di = sd.default.device[0]
+            if di not in (-1, None) and sd.query_devices(di).get('max_input_channels', 0) > 0:
+                return di
+        except Exception:
+            pass
+        # 3) 最初の入力可能デバイス
+        try:
+            for i, info in enumerate(sd.query_devices()):
+                if info.get('max_input_channels', 0) > 0:
+                    return i
+        except Exception:
+            pass
+        logger.warning("❌ 入力デバイスを決定できませんでした")
+        return None
+
+    def _resolve_output_device(self) -> Optional[int]:
+        val = audio_config.OUTPUT_DEVICE
+        if val is not None and str(val).strip() != "":
+            s = str(val).strip()
+            if s.isdigit():
+                try:
+                    idx = int(s)
+                    if sd.query_devices(idx).get('max_output_channels', 0) > 0:
+                        return idx
+                except Exception:
+                    pass
+            else:
+                idx = self._device_index_by_name(s, 'output')
+                if idx is not None:
+                    return idx
+        try:
+            do = sd.default.device[1]
+            if do not in (-1, None) and sd.query_devices(do).get('max_output_channels', 0) > 0:
+                return do
+        except Exception:
+            pass
+        try:
+            for i, info in enumerate(sd.query_devices()):
+                if info.get('max_output_channels', 0) > 0:
+                    return i
+        except Exception:
+            pass
+        return None
+
+    def _test_input_device_frames(self, device_id: int, sample_rate: int, timeout_s: float = 0.6) -> bool:
+        """実フレームが届き、かつ無音ゼロではないかを確認する。"""
+        try:
+            from collections import deque
+            got = deque(maxlen=20)
+            frame_count = 0
+            
+            def cb(indata, frames, time_info, status):
+                nonlocal frame_count
+                frame_count += 1
+                if status:
+                    pass
+                # 簡易RMSで無音ゼロを判定
+                try:
+                    import numpy as _np
+                    rms = float(_np.sqrt(_np.mean((indata.astype(_np.float32) / 32768.0) ** 2)))
+                except Exception:
+                    rms = 0.0
+                got.append(rms)
+                
+            block = max(1, int(sample_rate * audio_config.FRAME_DUR_MS / 1000))
+            device_param = (device_id, None)
+            s = sd.InputStream(
+                channels=1,
+                samplerate=sample_rate,
+                dtype=audio_config.DTYPE,
+                blocksize=block,
+                device=device_param,
+                callback=cb,
+            )
+            s.start()
+            t0 = time.time()
+            ok = False
+            while time.time() - t0 < timeout_s:
+                if got:
+                    # 最低10フレームは受信していることを確認
+                    if frame_count >= 10:
+                        # フレームは届いているが、全て完全無音(-inf dBFS相当)かチェック
+                        max_rms = max(got) if got else 0.0
+                        if max_rms > 1e-7:  # 閾値を少し下げてテスト
+                            ok = True
+                            break
+                        elif frame_count >= 20:
+                            # 20フレーム以上届いているが全て無音 → 機能しないデバイス
+                            logger.debug(f"デバイス[{device_id}]: フレームは届くが全て無音 (max_rms={max_rms:.2e})")
+                            break
+                time.sleep(0.05)
+            s.stop(); s.close()
+            
+            if frame_count == 0:
+                logger.debug(f"デバイス[{device_id}]: フレーム未受信")
+            elif not ok and frame_count > 0:
+                logger.debug(f"デバイス[{device_id}]: {frame_count}フレーム受信、但し無音のみ")
+                
+            return ok
+        except Exception as e:
+            logger.debug(f"デバイス[{device_id}]テストエラー: {e}")
+            return False
+
+    def _ensure_working_samplerate(self, device_id: int) -> int:
+        """現在の設定サンプルレートが合わない場合に 16k → 8k の順でフォールバック。"""
+        sr_try = [audio_config.SAMPLE_RATE]
+        if 16000 not in sr_try:
+            sr_try.append(16000)
+        if 8000 not in sr_try:
+            sr_try.append(8000)
+        for sr in sr_try:
+            if self._test_input_device_frames(device_id, sr, timeout_s=0.6):
+                if sr != audio_config.SAMPLE_RATE:
+                    logger.info(f"🎛 入力サンプルレートを {audio_config.SAMPLE_RATE}Hz → {sr}Hz に切替")
+                    audio_config.SAMPLE_RATE = sr
+                return sr
+        logger.warning("⚠️ いずれのサンプルレートでもフレーム未到達。設定値を継続します。")
+        return audio_config.SAMPLE_RATE
         
     def audio_callback(self, indata, frames, time_info, status):
         """オーディオコールバック"""
@@ -168,25 +332,42 @@ class AudioProcessor:
         self._squelch_until = max(self._squelch_until, time.time() + max(0.0, duration_sec))
         
     def start_stream(self):
-        """オーディオストリーム開始"""
+        """オーディオストリーム開始 (安定版)"""
         if self.stream is None:
+            # デバイス解決（テスト開閉は行わない簡潔な方式）
+            device_id = self._find_available_input_device()
+            if device_id is None:
+                logger.error("入力デバイスが見つかりません。ダミーストリームモードで起動します。")
+                self._start_dummy_stream()
+                return
+                
             try:
                 self.stream = sd.InputStream(
                     channels=audio_config.CHANNELS,
                     samplerate=audio_config.SAMPLE_RATE,
                     dtype=audio_config.DTYPE,
                     blocksize=audio_config.frame_length,
-                    # device is taken from sd.default
+                    device=device_id,
                     callback=self.audio_callback
                 )
-                self.stream.start()
-                logger.info(f"オーディオストリーム開始 samplerate={audio_config.SAMPLE_RATE}Hz block={audio_config.frame_length}")
             except Exception as e:
                 logger.error(f"オーディオストリーム作成失敗: {e}")
-                # sd.default.device[0] が None の可能性もある
-                if sd.default.device[0] is None:
-                    logger.error("入力デバイスが選択されていません。ダミーストリームモードで起動します。")
                 self._start_dummy_stream()
+                return
+            try:
+                self.stream.start()
+            except Exception as e:
+                logger.error(f"❌ ストリーム開始エラー: {e}")
+                logger.error(f"   デバイス {device_id} でエラー。ダミーストリームにフォールバック")
+                self.stream = None
+                self._start_dummy_stream()
+                return
+            # デバイス情報を記録
+            try:
+                in_dev = sd.query_devices(device_id)
+                logger.info(f"オーディオストリーム開始 device='[{device_id}] {in_dev.get('name','unknown')}' samplerate={audio_config.SAMPLE_RATE}Hz block={audio_config.frame_length}")
+            except Exception:
+                logger.info("オーディオストリーム開始")
     
     def stop_stream(self):
         """オーディオストリーム停止 (t-wada style robust implementation)"""
@@ -220,7 +401,100 @@ class AudioProcessor:
             except queue.Empty:
                 break
     
+    def _find_available_input_device(self) -> Optional[int]:
+        """利用可能な入力デバイスを探す（名前での除外は行わず、実テストで判定）"""
+        try:
+            devices = sd.query_devices()
+            tested_indices = set()
+
+            # 1) ユーザー指定があれば最優先でテスト
+            if audio_config.INPUT_DEVICE is not None:
+                user_spec = str(audio_config.INPUT_DEVICE)
+                
+                # A) If it's a number, treat as device index
+                if user_spec.isdigit():
+                    try:
+                        dev_idx = int(user_spec)
+                        tested_indices.add(dev_idx)
+                        info = sd.query_devices(dev_idx)
+                        if info.get('max_input_channels', 0) > 0 and self._test_input_device(dev_idx):
+                            logger.info(f"✅ 設定された入力デバイス使用: [{dev_idx}] {info['name']}")
+                            return dev_idx
+                        else:
+                            logger.warning(f"⚠️ 設定デバイスIDX [{dev_idx}] は入力不可またはテスト失敗")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 設定デバイスIDX [{user_spec}] のテストでエラー: {e}")
+
+                # B) If it's a string, search for matching device names
+                else:
+                    matching_devices = []
+                    for i, info in enumerate(devices):
+                        if user_spec.lower() in (info.get('name') or '').lower() and info.get('max_input_channels', 0) > 0:
+                            matching_devices.append((i, info))
+                    
+                    if matching_devices:
+                        logger.info(f"設定名 '{user_spec}' に一致する {len(matching_devices)} 個のデバイスをテストします...")
+                        for i, info in matching_devices:
+                            tested_indices.add(i)
+                            if self._test_input_device(i):
+                                logger.info(f"✅ 設定された入力デバイス使用: [{i}] {info['name']}")
+                                return i
+                        logger.warning(f"⚠️ 設定名 '{user_spec}' に一致するデバイスは全てテストに失敗しました")
+                    else:
+                        logger.warning(f"⚠️ 設定名 '{user_spec}' に一致する入力デバイスが見つかりません")
+
+            # 2) デフォルト入力デバイスをテスト
+            default_in = sd.default.device[0]
+            if default_in not in (-1, None) and default_in not in tested_indices:
+                tested_indices.add(default_in)
+                try:
+                    info = sd.query_devices(default_in)
+                    if info.get('max_input_channels', 0) > 0 and self._test_input_device(default_in):
+                        logger.info(f"✅ テスト済みデフォルト入力デバイス使用: [{default_in}] {info['name']}")
+                        return default_in
+                    else:
+                        logger.warning(f"⚠️ デフォルト入力デバイステスト失敗: [{default_in}] {info.get('name','?')}")
+                except Exception as e:
+                    logger.warning(f"⚠️ デフォルト入力デバイス使用不可: {e}")
+
+            # 3) 一覧から入力可能なデバイスを順にテスト
+            for i, info in enumerate(devices):
+                if i in tested_indices:
+                    continue
+                if info.get('max_input_channels', 0) > 0:
+                    if self._test_input_device(i):
+                        logger.info(f"✅ テスト済み入力デバイス使用: [{i}] {info.get('name','?')}")
+                        return i
+                    else:
+                        logger.warning(f"⚠️ デバイステスト失敗: [{i}] {info.get('name','?')}")
+
+            logger.warning("❌ 入力デバイスが見つかりませんでした")
+            return None
+
+        except Exception as e:
+            logger.error(f"❌ デバイス検索エラー: {e}")
+            return None
     
+    def _test_input_device(self, device_id: int) -> bool:
+        """指定したデバイスが正常に動作するかテストする (t-wada style)"""
+        try:
+            # 短時間のテストストリームを作成して開始/停止
+            test_stream = sd.InputStream(
+                channels=1,  # テスト用は1チャンネルのみ
+                samplerate=audio_config.SAMPLE_RATE,
+                dtype=audio_config.DTYPE,
+                blocksize=512,  # 小さなブロックサイズでテスト
+                device=device_id,
+                callback=lambda indata, frames, time, status: None  # ダミーコールバック
+            )
+            test_stream.start()
+            time.sleep(0.1)  # 100ms 待機
+            test_stream.stop()
+            test_stream.close()
+            return True
+        except Exception as e:
+            logger.debug(f"デバイステストエラー [{device_id}]: {e}")
+            return False
     
     def _start_dummy_stream(self):
         """ダミーストリーム開始 (マイクが無い環境でのテスト用)"""
@@ -451,6 +725,7 @@ class SpeechRecorder:
         voiced_ms = 0
         silence_ms = 0
         started = False
+        started_at = None  # type: Optional[float]
         
         start_time = time.time()
         
@@ -473,6 +748,7 @@ class SpeechRecorder:
                 silence_ms = 0
                 if not started and voiced_ms >= vad_config.MIN_UTTERANCE_MS:
                     started = True
+                    started_at = time.time()
                     logger.info("発話開始検出")
             else:
                 if started:
@@ -480,6 +756,11 @@ class SpeechRecorder:
             
             # 終了条件
             if started and silence_ms >= vad_config.END_SILENCE_MS:
+                # 発話開始直後は早期終了を抑制
+                if started_at is not None:
+                    elapsed_ms = int((time.time() - started_at) * 1000)
+                    if elapsed_ms < vad_config.HOLD_AFTER_START_MS:
+                        continue
                 logger.info(f"発話終了検出 (無音 {silence_ms}ms)")
                 break
             
@@ -543,7 +824,7 @@ def _fade_in_out(signal: np.ndarray, fade_ratio: float = 0.05) -> np.ndarray:
     window[-fr:] = np.linspace(1.0, 0.0, fr, dtype=np.float32)
     return (signal * window).astype(np.float32)
 
-def play_wake_sound():
+def play_wake_sound(audio_processor: Optional[AudioProcessor] = None):
     """簡単な二音『ポロン』通知音を再生"""
     try:
         sr = audio_config.SAMPLE_RATE
@@ -555,7 +836,18 @@ def play_wake_sound():
         tone1 = 0.2 * np.sin(2 * np.pi * 880 * t1).astype(np.float32)
         tone2 = 0.2 * np.sin(2 * np.pi * 660 * t2).astype(np.float32)
         signal = np.concatenate([_fade_in_out(tone1), _fade_in_out(tone2)])
-        sd.play(signal, samplerate=sr, blocking=True)
+        # 出力デバイスは解決済みがあれば優先
+        dev_param = None
+        if audio_processor is not None:
+            dev_param = audio_processor._resolved_output
+        dev = audio_config.OUTPUT_DEVICE
+        if dev_param is None and isinstance(dev, str) and dev.isdigit():
+            dev_param = int(dev)
+        try:
+            sd.play(signal, samplerate=sr, device=dev_param, blocking=True)
+        except Exception:
+            # デバイス名/番号が不正な場合はデフォルト出力で再試行
+            sd.play(signal, samplerate=sr, blocking=True)
     except Exception as e:
         logger.warning(f"通知音の再生に失敗: {e}")
 
@@ -874,7 +1166,16 @@ def speak_via_server_tts(text: str, audio_processor: AudioProcessor) -> None:
         dur = len(audio) / float(sr or audio_config.SAMPLE_RATE)
         # 再生音の回り込み抑制
         audio_processor.squelch(dur + 0.2)
-        sd.play(audio, samplerate=sr, blocking=False)
+        # 解決済みの出力デバイスを優先
+        dev_param = audio_processor._resolved_output
+        if dev_param is None:
+            dev = audio_config.OUTPUT_DEVICE
+            if isinstance(dev, str) and dev.isdigit():
+                dev_param = int(dev)
+        try:
+            sd.play(audio, samplerate=sr, device=dev_param, blocking=False)
+        except Exception:
+            sd.play(audio, samplerate=sr, blocking=False)
         logger.info(f"サーバーTTS再生 len={len(audio)} sr={sr} dur={dur:.2f}s")
     except Exception as e:
         logger.warning(f"サーバーTTS再生エラー: {e}")
@@ -882,33 +1183,6 @@ def speak_via_server_tts(text: str, audio_processor: AudioProcessor) -> None:
 # ========== メイン処理 ==========
 def main():
     """メインループ"""
-    # デバイス確定（TTSテストより前に！）
-    print("⚙️  オーディオデバイスを選択中...")
-    in_idx, out_idx = choose_devices(
-        samplerate=audio_config.SAMPLE_RATE,
-        blocklist=[s.strip().lower() for s in os.getenv("WAKE_AUDIO_BLOCKLIST","").split(",") if s.strip()],
-        allow_interactive=os.getenv("WAKE_AUDIO_SELECT","0").lower() in {"1","true","yes","on"},
-        remember=True,
-        strict_health=True,
-        require_pair_for_bt=None,  # macOSではFalse, その他ではTrueに自動設定
-    )
-    if in_idx is None:
-        logger.error("利用可能な入力デバイスが見つかりませんでした。")
-        sys.exit(1)
-
-    sd.default.device = (in_idx, out_idx if out_idx is not None else -1)
-    sd.default.samplerate = audio_config.SAMPLE_RATE
-    sd.default.channels = (audio_config.CHANNELS, 1)
-    
-    try:
-        dev_in_info = sd.query_devices(in_idx)
-        dev_out_info = sd.query_devices(out_idx) if out_idx is not None else None
-        in_name = dev_in_info['name'] if dev_in_info else 'N/A'
-        out_name = dev_out_info['name'] if dev_out_info else 'N/A'
-        logger.info(f"🎤 Input='{in_name}'  🔊 Output='{out_name}'")
-    except Exception as e:
-        logger.warning(f"選択デバイス情報の取得に失敗: {e}")
-
     print("\n" + "="*50)
     print("Wake Saiteku クライアント")
     print("="*50)
@@ -923,7 +1197,7 @@ def main():
     print("="*50 + "\n")
     
     # t-wada style TTS疎通テスト
-    if server_config.ENABLE_TTS_PLAYBACK:
+    if server_config.ENABLE_TTS_PLAYBACK and os.getenv("TTS_STARTUP_TEST", "true").lower() == "true":
         print("🔊 TTS疎通テスト実行中...")
         try:
             test_text = "Wake Saitekuクライアント起動完了。TTSが正常に動作しています。"
@@ -942,7 +1216,12 @@ def main():
                 import wave as _wave
                 with _wave.open(_io.BytesIO(r.content), "rb") as wf:
                     audio = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32) / 32767.0
-                    sd.play(audio, samplerate=wf.getframerate(), blocking=False)
+                    dev = audio_config.OUTPUT_DEVICE
+                    dev_param = int(dev) if isinstance(dev, str) and dev.isdigit() else dev
+                    try:
+                        sd.play(audio, samplerate=wf.getframerate(), device=dev_param, blocking=False)
+                    except Exception:
+                        sd.play(audio, samplerate=wf.getframerate(), blocking=False)
                     logger.info("✅ TTS初期化テスト完了")
                     time.sleep(1)  # 音声再生待機
             else:
@@ -975,55 +1254,120 @@ def main():
         logger.error(".env の SHERPA_* 設定とモデルパスをご確認ください。")
         sys.exit(1)
     
+    # オンデマンド方式: キー入力でマイク一時有効化
+    print("\n🎤 マイクアクセス最小化モード")
+    print("   スペースキーを押してWake Word検出を開始")
+    print("   'q' + Enter で終了")
+    print("   または環境変数 ALWAYS_LISTEN=true で従来モード")
+    
+    always_listen = os.getenv("ALWAYS_LISTEN", "false").lower() == "true"
+    
+    if always_listen:
+        print("\n⚠️ 常時リスニングモード (マイク常時オン)")
+        # 従来の常時リスニング
+        run_traditional_mode(audio_processor, wake_detector, speech_recorder)
+    else:
+        print("\n✅ オンデマンドモード (キー操作でのみマイク有効化)")
+        run_ondemand_mode(audio_processor, wake_detector, speech_recorder)
+
+
+def run_ondemand_mode(audio_processor, wake_detector, speech_recorder):
+    """オンデマンド方式: キーボード入力でのみマイクを有効化"""
+    import threading
+    import sys
+    import select
+    
+    print("\n操作方法:")
+    print("  [スペース] Wake Word検出開始 (10秒間)")
+    print("  [Enter] 直接音声録音開始")  
+    print("  [q] 終了")
+    
+    def get_key_input():
+        """キーボード入力を取得 (ノンブロッキング)"""
+        if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+            return sys.stdin.read(1)
+        return None
+    
     try:
         while True:
-            # Wake Word検出フェーズ
-            logger.info("Wake Word待機中...")
-            wake_detector.reset()
-            audio_processor.clear_queue()
+            print("\n🎤 待機中 (マイクオフ) - キーを押してください...")
             
-            min_db = float(os.getenv("WAKE_MIN_DBFS", "-75"))
+            # キーボード入力待機
             while True:
-                pcm = audio_processor.get_audio_frame(timeout=1.0)
-                if pcm is None:
-                    # しばらくフレームが来ない場合はストリームを復帰
-                    if time.time() - audio_processor.last_frame_time > 3.0:
-                        logger.warning("🎤 音声フレームが3秒以上届いていません。ストリームを再起動します。")
-                        try:
-                            audio_processor.stop_stream()
-                            time.sleep(0.2)
-                            audio_processor.start_stream()
-                        except Exception as e:
-                            logger.error(f"オーディオストリーム再起動に失敗: {e}")
-                            time.sleep(0.5)
-                    continue
-                
-                # 1秒毎に入力レベルをINFOで出す（動作確認用）
-                now = time.time()
-                if now - audio_processor._last_level_log >= 1.0:
-                    level = _dbfs(pcm.reshape(-1))
-                    logger.info(f"🎚️ 入力レベル: {level:.1f} dBFS")
-                    audio_processor._last_level_log = now
+                try:
+                    key = input().strip().lower()
+                    if key == 'q':
+                        return
+                    elif key == '' or key == ' ':
+                        # スペースまたはEnterでWake Word検出
+                        perform_voice_interaction(audio_processor, wake_detector, speech_recorder)
+                        break
+                except KeyboardInterrupt:
+                    return
+                except EOFError:
+                    return
+                    
+    except KeyboardInterrupt:
+        print("\n👋 終了します...")
 
-                # レベルが低すぎる場合はスキップ（誤検知抑制）
-                if _dbfs(pcm.reshape(-1)) < min_db:
-                    continue
 
-                if wake_detector.process_audio(pcm.tobytes()):
-                    # 発話処理ごとの相関IDを採番
-                    interaction_id = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
-                    print("\n✅ Wake Word検出!")
-                    print(f"🆔 ID: {interaction_id}")
-                    logger.info(f"[{interaction_id}] Wake Word検出")
-                    # 通知音を鳴らし、回り込み対策でしばらく入力無視
-                    beep_len = 0.18
-                    audio_processor.squelch(beep_len + 0.15)
-                    play_wake_sound()
-                    print("📢 お話しください...")
-                    break
+def perform_voice_interaction(audio_processor, wake_detector, speech_recorder):
+    """音声インタラクション実行 (マイク一時有効化)"""
+    interaction_id = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+    
+    try:
+        print("🎤 マイク有効化中...")
+        audio_processor.start_stream()
+        time.sleep(0.5)  # ストリーム安定化待機
+        
+        print("📢 お話しください... (5秒間録音)")
+        
+        # 直接録音開始
+        rec_start = time.perf_counter()
+        audio_data = speech_recorder.record_speech()
+        rec_dur = time.perf_counter() - rec_start
+        
+        if len(audio_data) == 0:
+            print("⚠️ 音声が検出されませんでした")
+            return
+            
+        print(f"📦 録音完了 ({len(audio_data) / audio_config.SAMPLE_RATE:.1f}秒)")
+        
+        # サーバー送信またはオフライン処理
+        success, response = send_to_server(audio_data, interaction_id)
+        
+        if success and response:
+            transcript = response.get("transcript", "")
+            reply = response.get("reply", "")
+            print(f"📝 認識: {transcript}")
+            print(f"🤖 応答: {reply}")
+            
+            # TTS再生
+            if server_config.ENABLE_TTS_PLAYBACK and reply:
+                speak_via_server_tts(reply, audio_processor)
+        else:
+            print("❌ 処理に失敗しました")
+            
+    finally:
+        print("🎤 マイク無効化")
+        audio_processor.stop_stream()
+
+
+def run_traditional_mode(audio_processor, wake_detector, speech_recorder):
+    """従来の常時リスニング方式"""
+    print("⚠️ この機能は現在利用できません。オンデマンドモードをご利用ください。")
+
+
+if __name__ == "__main__":
+    main()
             
             # 少し待ってキューをクリア（Wake Wordの残響を除去）
-            time.sleep(0.2)
+            # Wake通知後の待機（呼吸/体勢を整える余裕を確保）
+            try:
+                post_wait_ms = int(os.getenv("POST_WAKE_DELAY_MS", "600"))
+            except Exception:
+                post_wait_ms = 600
+            time.sleep(max(0.0, post_wait_ms / 1000.0))
             audio_processor.clear_queue()
             
             # 音声録音フェーズ

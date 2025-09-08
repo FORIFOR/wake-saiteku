@@ -7,7 +7,8 @@ LABEL="com.saiteku.server"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
 PORT="${SERVER_PORT:-9050}"
-PYTHON_BIN="$PROJECT_ROOT/venv311/bin/python"
+VENV_DIR="${VENV_DIR:-$PROJECT_ROOT/venv}"
+PYTHON_BIN="$VENV_DIR/bin/python"
 ZSH_BIN="/bin/zsh"
 
 echo "Project: $PROJECT_ROOT"
@@ -16,7 +17,7 @@ echo "Port:    $PORT"
 
 if [[ ! -x "$PYTHON_BIN" ]]; then
   echo "[!] $PYTHON_BIN not found. Create venv first:"
-  echo "    /opt/homebrew/bin/python3.11 -m venv $PROJECT_ROOT/venv311 && source $PROJECT_ROOT/venv311/bin/activate && pip install -r $PROJECT_ROOT/requirements-server.txt"
+  echo "    /opt/homebrew/bin/python3.9 -m venv $VENV_DIR && source $VENV_DIR/bin/activate && pip install -r $PROJECT_ROOT/requirements-server.txt"
   exit 1
 fi
 
@@ -33,7 +34,7 @@ cat > "$PLIST" <<PLIST
   <array>
     <string>${ZSH_BIN}</string>
     <string>-lc</string>
-    <string>cd ${PROJECT_ROOT} && source venv311/bin/activate && source config/server.env 2>/dev/null || true; SERVER_HOST=127.0.0.1 SERVER_PORT=${PORT} LOG_TO_FILE=true LOG_DIR=logs ${PYTHON_BIN} server/server.py</string>
+    <string>cd ${PROJECT_ROOT} && source ${VENV_DIR}/bin/activate && source config/server.env 2>/dev/null || true; SERVER_HOST=127.0.0.1 SERVER_PORT=${PORT} LOG_TO_FILE=true LOG_DIR=logs ${PYTHON_BIN} server/server.py</string>
   </array>
   <key>WorkingDirectory</key>
   <string>${PROJECT_ROOT}</string>
@@ -66,4 +67,3 @@ launchctl start "$LABEL" || true
 echo "[✓] LaunchAgent loaded. Check status: launchctl list | grep ${LABEL}"
 echo "    Tail logs: tail -f ${PROJECT_ROOT}/logs/server.log ${PROJECT_ROOT}/logs/launchd-server.err"
 echo "    Health:   curl -sS http://127.0.0.1:${PORT}/"
-
