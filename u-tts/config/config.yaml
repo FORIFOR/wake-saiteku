@@ -1,0 +1,7 @@
+engines:
+  kokoro_onnx:
+    enabled: true
+    model: /Users/horioshuuhei/models/kokoro/kokoro-v1.0.onnx
+    voices: /Users/horioshuuhei/models/kokoro/voices-v1.0.bin
+  openjtalk:
+    enabled: false

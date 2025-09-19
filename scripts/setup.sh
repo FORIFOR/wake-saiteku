@@ -305,7 +305,7 @@ LLM_LOCAL_URL=http://127.0.0.1:8081/v1/chat/completions
 LLM_LOCAL_MODEL=qwen2.5-1.5b-instruct-q4_k_m
 
 # タイムアウト設定
-REQUEST_TIMEOUT=30
+REQUEST_TIMEOUT=60
 EOF
         echo -e "${GREEN}✓ クライアント設定ファイルを作成しました${NC}"
         echo -e "${YELLOW}注: SERVER_URLを実際のサーバーIPに変更してください${NC}"

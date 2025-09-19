@@ -18,6 +18,8 @@ import os
 import json
 import time
 import platform
+import queue
+import threading
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -96,36 +98,50 @@ def enumerate_devices(blocklist: Optional[List[str]] = None) -> List[Dev]:
         )
     return results
 
-# ====== 健康プローブ ======
+# ====== 健康プローブ（タイムアウト付き） ======
+PROBE_TIMEOUT = 0.5  # 応答しないデバイスを待つ最大秒数
+
 def _probe_input(dev: Dev, samplerate: int) -> Tuple[bool, Optional[str]]:
     if dev.max_in <= 0:
         return False, "no input channels"
+    
+    q = queue.Queue()
+    def worker():
+        try:
+            with sd.InputStream(
+                device=dev.index,
+                channels=1,
+                samplerate=samplerate,
+                dtype="int16",
+                blocksize=0,
+            ):
+                sd.sleep(150)
+            q.put((True, None))
+        except Exception as e:
+            q.put((False, str(e)))
+
+    thread = threading.Thread(target=worker)
+    thread.daemon = True
+    thread.start()
+
     try:
-        with sd.InputStream(
-            device=dev.index,
-            channels=1,
-            samplerate=samplerate,  # 例: 16000（HFP/HSP）
-            dtype="int16",
-            blocksize=0,
-        ):
-            sd.sleep(150)
-        return True, None
-    except Exception as e:
-        return False, str(e)
+        success, err = q.get(timeout=PROBE_TIMEOUT)
+        return (True, None) if success else (False, err)
+    except queue.Empty:
+        return False, f"Probe timed out after {PROBE_TIMEOUT}s"
 
 def _probe_output(dev: Dev, samplerate_hint: int) -> Tuple[bool, Optional[str]]:
     if dev.max_out <= 0:
         return False, "no output channels"
-    # 出力はデバイス既定 SR を優先（A2DP は概ね 44100/48000）
+    
     sr_candidates = [int(dev.default_sr)]
     if int(dev.default_sr) not in (44100, 48000):
         sr_candidates += [48000, 44100]
-    # 最後の手段としてヒント SR も試す
     if samplerate_hint not in sr_candidates:
         sr_candidates.append(samplerate_hint)
 
-    last_err = None
-    for sr in sr_candidates:
+    q = queue.Queue()
+    def worker(sr):
         try:
             with sd.OutputStream(
                 device=dev.index,
@@ -134,27 +150,52 @@ def _probe_output(dev: Dev, samplerate_hint: int) -> Tuple[bool, Optional[str]]:
                 dtype="int16",
                 blocksize=0,
             ) as s:
-                s.write(np.zeros((max(1, sr // 20), 1), dtype=np.int16))  # 50ms 無音
-            return True, None
+                s.write(np.zeros((max(1, sr // 20), 1), dtype=np.int16))
+            q.put((True, None))
         except Exception as e:
-            last_err = e
+            q.put((False, str(e)))
+
+    last_err = None
+    for sr in sr_candidates:
+        thread = threading.Thread(target=worker, args=(sr,))
+        thread.daemon = True
+        thread.start()
+        try:
+            success, err = q.get(timeout=PROBE_TIMEOUT)
+            if success:
+                return True, None
+            else:
+                last_err = err
+        except queue.Empty:
+            last_err = f"Probe timed out after {PROBE_TIMEOUT}s (sr={sr})"
             continue
     return False, (str(last_err) if last_err else "unknown")
 
 def _probe_duplex(in_dev: Dev, out_dev: Dev, samplerate: int) -> Tuple[bool, Optional[str]]:
-    """入出力同時オープン（HFP/HSP 一体型など）。macOS で別デバイスの BT 入出力は失敗しやすい。"""
+    q = queue.Queue()
+    def worker():
+        try:
+            with sd.Stream(
+                samplerate=samplerate,
+                dtype="int16",
+                channels=(1, 1),
+                blocksize=0,
+                device=(in_dev.index, out_dev.index),
+            ):
+                sd.sleep(120)
+            q.put((True, None))
+        except Exception as e:
+            q.put((False, str(e)))
+
+    thread = threading.Thread(target=worker)
+    thread.daemon = True
+    thread.start()
+
     try:
-        with sd.Stream(
-            samplerate=samplerate,
-            dtype="int16",
-            channels=(1, 1),
-            blocksize=0,
-            device=(in_dev.index, out_dev.index),
-        ):
-            sd.sleep(120)
-        return True, None
-    except Exception as e:
-        return False, str(e)
+        success, err = q.get(timeout=PROBE_TIMEOUT)
+        return (True, None) if success else (False, err)
+    except queue.Empty:
+        return False, f"Duplex probe timed out after {PROBE_TIMEOUT}s"
 
 # ====== スコアリングと優先度 ======
 def _score(dev: Dev, kind: str) -> int:
